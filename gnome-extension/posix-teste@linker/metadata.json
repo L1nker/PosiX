@@ -1,0 +1,7 @@
+{
+  "uuid": "posix-teste@linker",
+  "name": "PosiX Teste",
+  "description": "Teste seguro de move_resize_frame() para uma janela PosiX controlada.",
+  "shell-version": ["46"],
+  "version": 1
+}

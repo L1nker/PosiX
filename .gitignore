@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+.#*
+
+# Generated GNOME Shell extension packages
+*.shell-extension.zip
+
+# Logs
+*.log
+logs/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
