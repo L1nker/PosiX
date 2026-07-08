@@ -1,0 +1,9 @@
+{
+  "uuid": "posix@linker",
+  "name": "PosiX",
+  "description": "Prova de conceito D-Bus mínima do PosiX.",
+  "shell-version": [
+    "46"
+  ],
+  "version": 1
+}
