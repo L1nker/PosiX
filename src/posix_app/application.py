@@ -9,6 +9,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
 from posix_app.dbus_windows import PosiXContractError, PosiXDBusError, fetch_windows
+from posix_app.storage import StorageError, save_window_position
 from posix_app.window_identity import resolve_application
 
 
@@ -38,6 +39,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._loading = False
         self._records = []
+        self._selected_record = None
 
         self._build_ui()
 
@@ -55,6 +57,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._refresh_button = Gtk.Button(label="Atualizar")
         self._refresh_button.connect("clicked", self._on_refresh_clicked)
         header.pack_end(self._refresh_button)
+
+        self._save_button = Gtk.Button(label="Salvar posição")
+        self._save_button.set_sensitive(False)
+        self._save_button.connect("clicked", self._on_save_clicked)
+        header.pack_end(self._save_button)
 
         self._status_label = Gtk.Label(
             label="Carregando janelas...",
@@ -113,13 +120,32 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_refresh_clicked(self, _button):
         self.refresh_windows()
 
+    def _on_save_clicked(self, _button):
+        if self._selected_record is None or self._loading:
+            return
+
+        try:
+            saved_id = save_window_position(
+                self._selected_record["window"],
+                self._selected_record["application"],
+            )
+        except StorageError as error:
+            self._status_label.set_text(f"Não foi possível salvar a posição: {error}")
+            return
+
+        self._status_label.set_text(f"Posição salva com sucesso — ID {saved_id}")
+
     def refresh_windows(self):
         if self._loading:
             return
 
         self._loading = True
+        self._selected_record = None
+        self._list_box.unselect_all()
         self._refresh_button.set_sensitive(False)
+        self._save_button.set_sensitive(False)
         self._status_label.set_text("Carregando janelas...")
+        self._show_empty_details()
 
         thread = threading.Thread(target=self._load_windows_worker, daemon=True)
         thread.start()
@@ -147,6 +173,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _finish_loading(self, records, error):
         self._loading = False
         self._refresh_button.set_sensitive(True)
+        self._save_button.set_sensitive(self._selected_record is not None)
 
         if error:
             self._status_label.set_text(error)
@@ -154,6 +181,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._records = records
         self._populate_window_list(records)
+        self._list_box.unselect_all()
+        self._selected_record = None
+        self._save_button.set_sensitive(False)
         self._status_label.set_text(f"{len(records)} janelas encontradas")
         self._show_empty_details()
         return GLib.SOURCE_REMOVE
@@ -207,9 +237,16 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_row_selected(self, _list_box, row):
         if row is None:
+            self._selected_record = None
+            self._save_button.set_sensitive(False)
             self._show_empty_details()
             return
 
+        self._selected_record = {
+            "window": row.window_data,
+            "application": row.application_info,
+        }
+        self._save_button.set_sensitive(not self._loading)
         self._show_details(row.window_data, row.application_info)
 
     def _show_empty_details(self):
