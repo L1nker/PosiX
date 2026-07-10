@@ -8,8 +8,13 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-from posix_app.dbus_windows import PosiXContractError, PosiXDBusError, fetch_windows
-from posix_app.storage import StorageError, save_window_position
+from posix_app.dbus_windows import (
+    PosiXContractError,
+    PosiXDBusError,
+    fetch_windows,
+    move_resize_window,
+)
+from posix_app.storage import StorageError, list_saved_positions, save_window_position
 from posix_app.window_identity import resolve_application
 
 
@@ -38,10 +43,15 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_default_size(1100, 700)
 
         self._loading = False
+        self._restoring = False
         self._records = []
         self._selected_record = None
+        self._saved_positions = []
+        self._selected_saved_position = None
+        self._status_after_refresh = None
 
         self._build_ui()
+        self._load_saved_positions()
 
     def _build_ui(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -115,7 +125,47 @@ class MainWindow(Adw.ApplicationWindow):
             margin_bottom=18,
         )
         details_scroller.set_child(self._details_box)
+
+        self._window_details_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=10,
+        )
+        self._details_box.append(self._window_details_box)
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_margin_top(8)
+        separator.set_margin_bottom(8)
+        self._details_box.append(separator)
+
+        self._build_restore_section()
         self._show_empty_details()
+
+    def _build_restore_section(self):
+        restore_title = Gtk.Label(label="Restaurar posição salva", xalign=0)
+        restore_title.add_css_class("title-3")
+        self._details_box.append(restore_title)
+
+        self._saved_positions_model = Gtk.StringList.new(["Selecione uma posição salva"])
+        self._saved_positions_dropdown = Gtk.DropDown.new(self._saved_positions_model, None)
+        self._saved_positions_dropdown.set_selected(0)
+        self._saved_positions_dropdown.connect(
+            "notify::selected",
+            self._on_saved_position_selected,
+        )
+        self._details_box.append(self._saved_positions_dropdown)
+
+        self._saved_position_summary = Gtk.Label(
+            label="Nenhuma posição salva",
+            xalign=0,
+            wrap=True,
+        )
+        self._saved_position_summary.add_css_class("dim-label")
+        self._details_box.append(self._saved_position_summary)
+
+        self._restore_button = Gtk.Button(label="Restaurar posição")
+        self._restore_button.set_sensitive(False)
+        self._restore_button.connect("clicked", self._on_restore_clicked)
+        self._details_box.append(self._restore_button)
 
     def _on_refresh_clicked(self, _button):
         self.refresh_windows()
@@ -133,7 +183,14 @@ class MainWindow(Adw.ApplicationWindow):
             self._status_label.set_text(f"Não foi possível salvar a posição: {error}")
             return
 
+        self._load_saved_positions(select_id=saved_id)
         self._status_label.set_text(f"Posição salva com sucesso — ID {saved_id}")
+
+    def _on_restore_clicked(self, _button):
+        if not self._can_restore():
+            return
+
+        self._show_restore_confirmation()
 
     def refresh_windows(self):
         if self._loading:
@@ -142,8 +199,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._loading = True
         self._selected_record = None
         self._list_box.unselect_all()
-        self._refresh_button.set_sensitive(False)
-        self._save_button.set_sensitive(False)
+        self._update_action_sensitivity()
         self._status_label.set_text("Carregando janelas...")
         self._show_empty_details()
 
@@ -172,8 +228,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _finish_loading(self, records, error):
         self._loading = False
-        self._refresh_button.set_sensitive(True)
-        self._save_button.set_sensitive(self._selected_record is not None)
+        self._update_action_sensitivity()
 
         if error:
             self._status_label.set_text(error)
@@ -183,8 +238,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._populate_window_list(records)
         self._list_box.unselect_all()
         self._selected_record = None
-        self._save_button.set_sensitive(False)
-        self._status_label.set_text(f"{len(records)} janelas encontradas")
+        self._update_action_sensitivity()
+        if self._status_after_refresh:
+            self._status_label.set_text(self._status_after_refresh)
+            self._status_after_refresh = None
+        else:
+            self._status_label.set_text(f"{len(records)} janelas encontradas")
         self._show_empty_details()
         return GLib.SOURCE_REMOVE
 
@@ -238,7 +297,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_row_selected(self, _list_box, row):
         if row is None:
             self._selected_record = None
-            self._save_button.set_sensitive(False)
+            self._update_action_sensitivity()
             self._show_empty_details()
             return
 
@@ -246,7 +305,7 @@ class MainWindow(Adw.ApplicationWindow):
             "window": row.window_data,
             "application": row.application_info,
         }
-        self._save_button.set_sensitive(not self._loading)
+        self._update_action_sensitivity()
         self._show_details(row.window_data, row.application_info)
 
     def _show_empty_details(self):
@@ -254,7 +313,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         title = Gtk.Label(label="Selecione uma janela", xalign=0)
         title.add_css_class("title-3")
-        self._details_box.append(title)
+        self._window_details_box.append(title)
 
         text = Gtk.Label(
             label="Os detalhes da janela selecionada aparecerão aqui.",
@@ -262,14 +321,14 @@ class MainWindow(Adw.ApplicationWindow):
             wrap=True,
         )
         text.add_css_class("dim-label")
-        self._details_box.append(text)
+        self._window_details_box.append(text)
 
     def _show_details(self, window, app):
         self._clear_details()
 
         title = Gtk.Label(label="Detalhes da janela", xalign=0)
         title.add_css_class("title-3")
-        self._details_box.append(title)
+        self._window_details_box.append(title)
 
         frame = window.get("frame", {})
         relative = window.get("relative", {})
@@ -300,7 +359,7 @@ class MainWindow(Adw.ApplicationWindow):
         ]
 
         grid = Gtk.Grid(column_spacing=16, row_spacing=8)
-        self._details_box.append(grid)
+        self._window_details_box.append(grid)
 
         for index, (label, value) in enumerate(rows):
             key_label = Gtk.Label(label=f"{label}:", xalign=0)
@@ -317,14 +376,220 @@ class MainWindow(Adw.ApplicationWindow):
             child = next_child
 
     def _clear_details(self):
-        child = self._details_box.get_first_child()
+        child = self._window_details_box.get_first_child()
         while child is not None:
             next_child = child.get_next_sibling()
-            self._details_box.remove(child)
+            self._window_details_box.remove(child)
             child = next_child
 
     def _format_bool(self, value):
         return "Sim" if bool(value) else "Não"
+
+    def _load_saved_positions(self, select_id=None):
+        try:
+            self._saved_positions = list_saved_positions()
+        except StorageError as error:
+            self._saved_positions = []
+            self._selected_saved_position = None
+            self._status_label.set_text(f"Erro ao carregar posições salvas: {error}")
+            self._refresh_saved_positions_dropdown()
+            return
+
+        self._refresh_saved_positions_dropdown(select_id=select_id)
+
+    def _refresh_saved_positions_dropdown(self, select_id=None):
+        items = ["Selecione uma posição salva"]
+        items.extend(
+            f"ID {position.get('id')} — {position.get('name') or 'Posição sem nome'}"
+            for position in self._saved_positions
+        )
+        self._saved_positions_model.splice(
+            0,
+            self._saved_positions_model.get_n_items(),
+            items,
+        )
+
+        selected_index = 0
+        if select_id is not None:
+            for index, position in enumerate(self._saved_positions, start=1):
+                if position.get("id") == select_id:
+                    selected_index = index
+                    break
+
+        self._saved_positions_dropdown.set_selected(selected_index)
+        self._set_selected_saved_position_by_index(selected_index)
+
+        if not self._saved_positions:
+            self._saved_position_summary.set_text("Nenhuma posição salva")
+            self._saved_positions_dropdown.set_sensitive(False)
+        else:
+            self._saved_positions_dropdown.set_sensitive(not self._restoring)
+
+        self._update_action_sensitivity()
+
+    def _on_saved_position_selected(self, dropdown, _param):
+        self._set_selected_saved_position_by_index(dropdown.get_selected())
+        self._update_action_sensitivity()
+
+    def _set_selected_saved_position_by_index(self, selected_index):
+        if selected_index == 0 or selected_index > len(self._saved_positions):
+            self._selected_saved_position = None
+            if self._saved_positions:
+                self._saved_position_summary.set_text("Selecione uma posição salva")
+            else:
+                self._saved_position_summary.set_text("Nenhuma posição salva")
+            return
+
+        self._selected_saved_position = self._saved_positions[selected_index - 1]
+        self._saved_position_summary.set_text(
+            self._format_saved_position_summary(self._selected_saved_position)
+        )
+
+    def _format_saved_position_summary(self, position):
+        return (
+            f"Monitor {position.get('monitor_index')} · "
+            f"X global {position.get('global_x')} · "
+            f"Y global {position.get('global_y')} · "
+            f"{position.get('width')} × {position.get('height')}"
+        )
+
+    def _update_action_sensitivity(self):
+        busy = self._loading or self._restoring
+        self._refresh_button.set_sensitive(not busy)
+        self._save_button.set_sensitive(self._selected_record is not None and not busy)
+        self._restore_button.set_sensitive(self._can_restore())
+        self._saved_positions_dropdown.set_sensitive(
+            bool(self._saved_positions) and not self._restoring
+        )
+
+    def _can_restore(self):
+        return (
+            self._selected_record is not None
+            and self._selected_saved_position is not None
+            and not self._loading
+            and not self._restoring
+            and self._has_valid_restore_target()
+        )
+
+    def _has_valid_restore_target(self):
+        if self._selected_record is None:
+            return False
+
+        sequence = str(self._selected_record["window"].get("stableSequence", "")).strip()
+        if not sequence:
+            return False
+
+        position = self._selected_saved_position
+        if position is None:
+            return False
+
+        return all(
+            isinstance(position.get(key), int)
+            for key in ("global_x", "global_y", "width", "height")
+        ) and position["width"] > 0 and position["height"] > 0
+
+    def _show_restore_confirmation(self):
+        window = self._selected_record["window"]
+        app = self._selected_record["application"]
+        position = self._selected_saved_position
+        frame = window.get("frame", {})
+        body = "\n".join([
+            f"Janela aberta: {app.get('resolved', '')} — {window.get('title', '')}",
+            f"Posição salva: ID {position.get('id')} — {position.get('name') or ''}",
+            (
+                "Geometria atual: "
+                f"X={frame.get('x', 0)} Y={frame.get('y', 0)} "
+                f"{frame.get('width', 0)} × {frame.get('height', 0)}"
+            ),
+            (
+                "Será aplicada: "
+                f"X={position.get('global_x')} Y={position.get('global_y')} "
+                f"{position.get('width')} × {position.get('height')}"
+            ),
+        ])
+
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Confirmar restauração",
+            body=body,
+        )
+        dialog.add_response("cancelar", "Cancelar")
+        dialog.add_response("restaurar", "Restaurar")
+        dialog.set_default_response("cancelar")
+        dialog.set_close_response("cancelar")
+        dialog.set_response_appearance("restaurar", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", self._on_restore_dialog_response)
+        dialog.present()
+
+    def _on_restore_dialog_response(self, _dialog, response):
+        if response != "restaurar":
+            return
+
+        self._start_restore()
+
+    def _start_restore(self):
+        if not self._can_restore():
+            self._status_label.set_text("Não foi possível restaurar: seleção inválida.")
+            return
+
+        self._restoring = True
+        self._update_action_sensitivity()
+        self._status_label.set_text("Restaurando posição...")
+
+        window = self._selected_record["window"]
+        position = self._selected_saved_position
+        thread = threading.Thread(
+            target=self._restore_worker,
+            args=(
+                str(window.get("stableSequence", "")).strip(),
+                position["global_x"],
+                position["global_y"],
+                position["width"],
+                position["height"],
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _restore_worker(self, stable_sequence, x, y, width, height):
+        try:
+            result = move_resize_window(stable_sequence, x, y, width, height)
+            GLib.idle_add(self._finish_restore, result, None)
+        except (PosiXDBusError, PosiXContractError) as error:
+            GLib.idle_add(self._finish_restore, None, str(error))
+        except Exception as error:
+            GLib.idle_add(self._finish_restore, None, f"Erro inesperado: {error}")
+
+    def _finish_restore(self, result, error):
+        self._restoring = False
+
+        if error:
+            self._status_label.set_text(f"Erro ao restaurar a posição: {error}")
+            self._update_action_sensitivity()
+            return GLib.SOURCE_REMOVE
+
+        if not result.get("success"):
+            self._status_label.set_text(
+                f"Não foi possível restaurar a posição: {result.get('error', '')}"
+            )
+            self._update_action_sensitivity()
+            return GLib.SOURCE_REMOVE
+
+        if result.get("exact"):
+            message = "Posição restaurada com sucesso — geometria exata"
+        else:
+            difference = result.get("difference") or {}
+            message = (
+                "Posição restaurada com diferenças: "
+                f"X={difference.get('x', 0)} "
+                f"Y={difference.get('y', 0)} "
+                f"L={difference.get('width', 0)} "
+                f"A={difference.get('height', 0)}"
+            )
+
+        self._status_after_refresh = message
+        self.refresh_windows()
+        return GLib.SOURCE_REMOVE
 
 
 def main(argv=None):
