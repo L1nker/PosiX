@@ -14,7 +14,12 @@ from posix_app.dbus_windows import (
     fetch_windows,
     move_resize_window,
 )
-from posix_app.storage import StorageError, list_saved_positions, save_window_position
+from posix_app.storage import (
+    StorageError,
+    delete_saved_position,
+    list_saved_positions,
+    save_window_position,
+)
 from posix_app.window_identity import resolve_application
 from posix_app.window_matching import WindowMatchingError, find_best_window_match
 
@@ -45,6 +50,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._loading = False
         self._restoring = False
+        self._deleting = False
         self._records = []
         self._selected_record = None
         self._saved_positions = []
@@ -164,6 +170,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._saved_position_summary.add_css_class("dim-label")
         self._details_box.append(self._saved_position_summary)
 
+        self._delete_saved_position_button = Gtk.Button(label="Excluir posição salva")
+        self._delete_saved_position_button.add_css_class("destructive-action")
+        self._delete_saved_position_button.set_sensitive(False)
+        self._delete_saved_position_button.connect(
+            "clicked",
+            self._on_delete_saved_position_clicked,
+        )
+        self._details_box.append(self._delete_saved_position_button)
+
         self._match_suggestion_label = Gtk.Label(
             label="Selecione uma posição salva para procurar a janela correspondente.",
             xalign=0,
@@ -186,7 +201,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh_windows()
 
     def _on_save_clicked(self, _button):
-        if self._selected_record is None or self._loading:
+        if self._selected_record is None or self._is_busy():
             return
 
         try:
@@ -207,8 +222,14 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._show_restore_confirmation()
 
+    def _on_delete_saved_position_clicked(self, _button):
+        if not self._can_delete_saved_position():
+            return
+
+        self._show_delete_saved_position_confirmation()
+
     def refresh_windows(self):
-        if self._loading:
+        if self._is_busy():
             return
 
         self._loading = True
@@ -442,7 +463,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._saved_position_summary.set_text("Nenhuma posição salva")
             self._saved_positions_dropdown.set_sensitive(False)
         else:
-            self._saved_positions_dropdown.set_sensitive(not self._restoring)
+            self._saved_positions_dropdown.set_sensitive(not self._is_busy())
 
         self._update_match_suggestion()
         self._update_action_sensitivity()
@@ -476,14 +497,18 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _update_action_sensitivity(self):
-        busy = self._loading or self._restoring
+        busy = self._is_busy()
         self._refresh_button.set_sensitive(not busy)
         self._save_button.set_sensitive(self._selected_record is not None and not busy)
         self._restore_button.set_sensitive(self._can_restore())
         self._select_suggested_button.set_sensitive(self._can_select_suggested_window())
+        self._delete_saved_position_button.set_sensitive(self._can_delete_saved_position())
         self._saved_positions_dropdown.set_sensitive(
-            bool(self._saved_positions) and not self._restoring
+            bool(self._saved_positions) and not busy
         )
+
+    def _is_busy(self):
+        return self._loading or self._restoring or self._deleting
 
     def _can_restore(self):
         return (
@@ -491,6 +516,7 @@ class MainWindow(Adw.ApplicationWindow):
             and self._selected_saved_position is not None
             and not self._loading
             and not self._restoring
+            and not self._deleting
             and self._has_valid_restore_target()
         )
 
@@ -500,6 +526,26 @@ class MainWindow(Adw.ApplicationWindow):
             and self._selected_saved_position is not None
             and not self._loading
             and not self._restoring
+            and not self._deleting
+        )
+
+    def _can_delete_saved_position(self):
+        return (
+            self._is_valid_saved_position_id()
+            and not self._loading
+            and not self._restoring
+            and not self._deleting
+        )
+
+    def _is_valid_saved_position_id(self):
+        if self._selected_saved_position is None:
+            return False
+
+        position_id = self._selected_saved_position.get("id")
+        return (
+            isinstance(position_id, int)
+            and not isinstance(position_id, bool)
+            and position_id > 0
         )
 
     def _has_valid_restore_target(self):
@@ -552,7 +598,40 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.connect("response", self._on_restore_dialog_response)
         dialog.present()
 
+    def _show_delete_saved_position_confirmation(self):
+        position = self._selected_saved_position
+        body = "\n".join([
+            f"ID: {position.get('id')}",
+            f"Nome: {position.get('name') or ''}",
+            f"Aplicativo: {position.get('application') or ''}",
+            f"Título: {position.get('title') or ''}",
+            f"Monitor: {position.get('monitor_index')}",
+            (
+                "Geometria global: "
+                f"X={position.get('global_x')} Y={position.get('global_y')}"
+            ),
+            f"Dimensão: {position.get('width')} × {position.get('height')}",
+            "",
+            "Esta ação não pode ser desfeita.",
+        ])
+
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Excluir posição salva?",
+            body=body,
+        )
+        dialog.add_response("cancelar", "Cancelar")
+        dialog.add_response("excluir", "Excluir")
+        dialog.set_default_response("cancelar")
+        dialog.set_close_response("cancelar")
+        dialog.set_response_appearance("excluir", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", self._on_delete_dialog_response)
+        dialog.present()
+
     def _update_match_suggestion(self):
+        if self._deleting:
+            return
+
         self._clear_match_suggestion()
 
         if self._selected_saved_position is None:
@@ -663,6 +742,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._start_restore()
 
+    def _on_delete_dialog_response(self, _dialog, response):
+        if response != "excluir":
+            return
+
+        self._start_delete_saved_position()
+
     def _start_restore(self):
         if not self._can_restore():
             self._status_label.set_text("Não foi possível restaurar: seleção inválida.")
@@ -686,6 +771,62 @@ class MainWindow(Adw.ApplicationWindow):
             daemon=True,
         )
         thread.start()
+
+    def _start_delete_saved_position(self):
+        if not self._can_delete_saved_position():
+            self._status_label.set_text("Não foi possível excluir: posição inválida.")
+            return
+
+        position_id = self._selected_saved_position["id"]
+        self._deleting = True
+        self._update_action_sensitivity()
+        self._status_label.set_text("Excluindo posição salva...")
+
+        thread = threading.Thread(
+            target=self._delete_saved_position_worker,
+            args=(position_id,),
+            daemon=True,
+        )
+        thread.start()
+
+    def _delete_saved_position_worker(self, position_id):
+        try:
+            deleted = delete_saved_position(position_id)
+            GLib.idle_add(self._finish_delete_saved_position, deleted, None, False)
+        except StorageError as error:
+            GLib.idle_add(self._finish_delete_saved_position, None, str(error), False)
+        except Exception as error:
+            GLib.idle_add(
+                self._finish_delete_saved_position,
+                None,
+                str(error),
+                True,
+            )
+
+    def _finish_delete_saved_position(self, deleted, error, unexpected_error):
+        self._deleting = False
+
+        if error:
+            if unexpected_error:
+                message = f"Erro ao excluir a posição salva: {error}"
+            else:
+                message = f"Não foi possível excluir a posição salva: {error}"
+            self._status_label.set_text(message)
+            self._update_action_sensitivity()
+            return GLib.SOURCE_REMOVE
+
+        if deleted:
+            message = "Posição salva excluída com sucesso."
+        else:
+            message = "A posição salva não existe mais."
+
+        self._load_saved_positions()
+        self._selected_saved_position = None
+        self._clear_match_suggestion()
+        self._update_match_suggestion()
+        self._status_label.set_text(message)
+        self._update_action_sensitivity()
+        return GLib.SOURCE_REMOVE
 
     def _restore_worker(self, stable_sequence, x, y, width, height):
         try:
