@@ -130,6 +130,27 @@ def list_saved_positions():
         raise StorageError(f"Erro SQLite ao listar posições: {error}") from error
 
 
+def delete_saved_position(position_id):
+    """Remove uma posição salva pelo ID e informa se uma linha foi excluída."""
+    validated_id = _validate_position_id(position_id)
+
+    try:
+        database_path = get_database_path()
+        if not database_path.exists():
+            return False
+
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            cursor = connection.execute(
+                "DELETE FROM saved_positions WHERE id = ?",
+                (validated_id,),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as error:
+        raise StorageError(f"Erro SQLite ao excluir posição: {error}") from error
+
+
 def get_database_path():
     data_home = os.environ.get("XDG_DATA_HOME")
     if data_home:
@@ -203,3 +224,12 @@ def _int_or_none(value):
     except (TypeError, ValueError):
         return None
 
+
+def _validate_position_id(position_id):
+    if isinstance(position_id, bool) or not isinstance(position_id, int):
+        raise StorageError("O ID da posição deve ser um inteiro positivo.")
+
+    if position_id <= 0:
+        raise StorageError("O ID da posição deve ser um inteiro positivo.")
+
+    return position_id
