@@ -16,6 +16,14 @@ const INTERFACE_XML = `
     <method name="ListWindows">
       <arg type="s" name="json" direction="out"/>
     </method>
+    <method name="MoveResizeWindow">
+      <arg type="s" name="stableSequence" direction="in"/>
+      <arg type="i" name="x" direction="in"/>
+      <arg type="i" name="y" direction="in"/>
+      <arg type="i" name="width" direction="in"/>
+      <arg type="i" name="height" direction="in"/>
+      <arg type="s" name="json" direction="out"/>
+    </method>
   </interface>
 </node>`;
 
@@ -66,6 +74,30 @@ export default class PosiXExtension extends Extension {
             schemaVersion: 1,
             windows,
         });
+    }
+
+    MoveResizeWindow(stableSequence, x, y, width, height) {
+        this._log(
+            `MoveResizeWindow solicitado: sequência ${stableSequence}, ${x} ${y} ${width} ${height}`
+        );
+
+        try {
+            const result = this._moveResizeWindow(stableSequence, x, y, width, height);
+            if (result.success)
+                this._log(`MoveResizeWindow concluído: exact=${result.exact}`);
+            else
+                this._log(`MoveResizeWindow falhou: ${result.error}`);
+            return JSON.stringify(result);
+        } catch (error) {
+            const requested = this._requestedGeometry(x, y, width, height);
+            const result = this._moveResizeFailure(
+                String(stableSequence ?? ''),
+                requested,
+                error.message
+            );
+            this._log(`MoveResizeWindow falhou: ${error.message}`);
+            return JSON.stringify(result);
+        }
     }
 
     _onBusAcquired(connection, _name) {
@@ -140,6 +172,136 @@ export default class PosiXExtension extends Extension {
         });
 
         return result;
+    }
+
+    _moveResizeWindow(stableSequence, x, y, width, height) {
+        const sequence = String(stableSequence ?? '').trim();
+        const requested = this._requestedGeometry(x, y, width, height);
+
+        this._validateMoveResizeRequest(sequence, requested);
+
+        const metaWindow = this._findWindowByStableSequence(sequence);
+        if (!metaWindow) {
+            return this._moveResizeFailure(
+                sequence,
+                requested,
+                'Janela não encontrada para a stable sequence informada.'
+            );
+        }
+
+        if (this._safeCall(() => metaWindow.is_fullscreen(), false)) {
+            return this._moveResizeFailure(
+                sequence,
+                requested,
+                'A janela está em tela cheia e não será restaurada nesta etapa.'
+            );
+        }
+
+        if (this._safeCall(() => metaWindow.get_maximized(), 0) !== 0) {
+            return this._moveResizeFailure(
+                sequence,
+                requested,
+                'A janela está maximizada e não será restaurada nesta etapa.'
+            );
+        }
+
+        const before = this._geometryFromRect(this._safeCall(
+            () => metaWindow.get_frame_rect(),
+            null
+        ));
+
+        metaWindow.move_resize_frame(
+            true,
+            requested.x,
+            requested.y,
+            requested.width,
+            requested.height
+        );
+
+        const after = this._geometryFromRect(this._safeCall(
+            () => metaWindow.get_frame_rect(),
+            null
+        ));
+        const difference = {
+            x: after.x - requested.x,
+            y: after.y - requested.y,
+            width: after.width - requested.width,
+            height: after.height - requested.height,
+        };
+        const exact = (
+            difference.x === 0 &&
+            difference.y === 0 &&
+            difference.width === 0 &&
+            difference.height === 0
+        );
+
+        return {
+            success: true,
+            stableSequence: sequence,
+            before,
+            requested,
+            after,
+            difference,
+            exact,
+            error: '',
+        };
+    }
+
+    _findWindowByStableSequence(stableSequence) {
+        const actors = this._safeCall(() => global.get_window_actors(), []);
+
+        for (const actor of actors) {
+            const metaWindow = this._safeCall(() => actor.get_meta_window(), null);
+            if (!metaWindow)
+                continue;
+
+            const currentSequence = String(this._safeCall(
+                () => metaWindow.get_stable_sequence(),
+                ''
+            ));
+            if (currentSequence === stableSequence)
+                return metaWindow;
+        }
+
+        return null;
+    }
+
+    _validateMoveResizeRequest(stableSequence, requested) {
+        if (!stableSequence)
+            throw new Error('stableSequence não pode ser vazia.');
+
+        for (const key of ['x', 'y', 'width', 'height']) {
+            if (!Number.isFinite(requested[key]) || !Number.isInteger(requested[key]))
+                throw new Error(`Valor inválido para ${key}.`);
+        }
+
+        if (requested.width <= 0)
+            throw new Error('width deve ser maior que zero.');
+
+        if (requested.height <= 0)
+            throw new Error('height deve ser maior que zero.');
+    }
+
+    _requestedGeometry(x, y, width, height) {
+        return {
+            x: Number(x),
+            y: Number(y),
+            width: Number(width),
+            height: Number(height),
+        };
+    }
+
+    _moveResizeFailure(stableSequence, requested, error) {
+        return {
+            success: false,
+            stableSequence,
+            before: null,
+            requested,
+            after: null,
+            difference: null,
+            exact: false,
+            error,
+        };
     }
 
     _serializeWindow(metaWindow, stableSequence) {

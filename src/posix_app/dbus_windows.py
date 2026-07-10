@@ -50,6 +50,25 @@ def fetch_windows(timeout_ms=DEFAULT_TIMEOUT_MS):
     return _validate_payload(payload)
 
 
+def move_resize_window(stable_sequence, x, y, width, height, timeout_ms=DEFAULT_TIMEOUT_MS):
+    """Solicita à extensão que aplique geometria a uma janela da sessão atual."""
+    response = _call_move_resize_window(
+        stable_sequence,
+        x,
+        y,
+        width,
+        height,
+        timeout_ms,
+    )
+
+    try:
+        payload = json.loads(response)
+    except json.JSONDecodeError as error:
+        raise PosiXContractError(f"JSON inválido retornado pela extensão: {error}") from error
+
+    return _validate_move_resize_payload(payload)
+
+
 def _call_list_windows(timeout_ms):
     try:
         proxy = Gio.DBusProxy.new_for_bus_sync(
@@ -72,6 +91,43 @@ def _call_list_windows(timeout_ms):
         )
     except GLib.Error as error:
         raise PosiXDBusError(_describe_gio_error(error)) from error
+
+    return result.unpack()[0]
+
+
+def _call_move_resize_window(stable_sequence, x, y, width, height, timeout_ms):
+    try:
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+            None,
+        )
+        proxy.set_default_timeout(timeout_ms)
+
+        result = proxy.call_sync(
+            "MoveResizeWindow",
+            GLib.Variant(
+                "(siiii)",
+                (
+                    str(stable_sequence),
+                    int(x),
+                    int(y),
+                    int(width),
+                    int(height),
+                ),
+            ),
+            Gio.DBusCallFlags.NONE,
+            timeout_ms,
+            None,
+        )
+    except GLib.Error as error:
+        raise PosiXDBusError(_describe_gio_error(error)) from error
+    except (TypeError, ValueError) as error:
+        raise PosiXContractError(f"Parâmetros inválidos para MoveResizeWindow: {error}") from error
 
     return result.unpack()[0]
 
@@ -142,3 +198,61 @@ def _validate_geometry(index, field_name, value, required_fields):
             f"{', '.join(missing)}."
         )
 
+
+def _validate_move_resize_payload(payload):
+    if not isinstance(payload, dict):
+        raise PosiXContractError("Contrato inválido: resposta MoveResizeWindow não é objeto.")
+
+    required_fields = {
+        "success",
+        "stableSequence",
+        "before",
+        "requested",
+        "after",
+        "difference",
+        "exact",
+        "error",
+    }
+    missing = sorted(required_fields - set(payload))
+    if missing:
+        raise PosiXContractError(
+            f"Contrato inválido: MoveResizeWindow sem campos: {', '.join(missing)}."
+        )
+
+    if not isinstance(payload["success"], bool):
+        raise PosiXContractError("Contrato inválido: success não é booleano.")
+
+    if not isinstance(payload["stableSequence"], str):
+        raise PosiXContractError("Contrato inválido: stableSequence não é string.")
+
+    if not isinstance(payload["exact"], bool):
+        raise PosiXContractError("Contrato inválido: exact não é booleano.")
+
+    if not isinstance(payload["error"], str):
+        raise PosiXContractError("Contrato inválido: error não é string.")
+
+    _validate_result_geometry("requested", payload["requested"])
+
+    for field_name in ("before", "after", "difference"):
+        value = payload[field_name]
+        if value is not None:
+            _validate_result_geometry(field_name, value)
+
+    return payload
+
+
+def _validate_result_geometry(field_name, value):
+    if not isinstance(value, dict):
+        raise PosiXContractError(f"Contrato inválido: {field_name} não é objeto.")
+
+    missing = sorted(REQUIRED_GEOMETRY_FIELDS - set(value))
+    if missing:
+        raise PosiXContractError(
+            f"Contrato inválido: {field_name} sem campos: {', '.join(missing)}."
+        )
+
+    for key in REQUIRED_GEOMETRY_FIELDS:
+        if not isinstance(value[key], int):
+            raise PosiXContractError(
+                f"Contrato inválido: {field_name}.{key} não é inteiro."
+            )
