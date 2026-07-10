@@ -16,6 +16,7 @@ from posix_app.dbus_windows import (
 )
 from posix_app.storage import StorageError, list_saved_positions, save_window_position
 from posix_app.window_identity import resolve_application
+from posix_app.window_matching import WindowMatchingError, find_best_window_match
 
 
 APPLICATION_ID = "io.github.L1nker.PosiX.App"
@@ -48,6 +49,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._selected_record = None
         self._saved_positions = []
         self._selected_saved_position = None
+        self._suggested_match = None
         self._status_after_refresh = None
 
         self._build_ui()
@@ -162,6 +164,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._saved_position_summary.add_css_class("dim-label")
         self._details_box.append(self._saved_position_summary)
 
+        self._match_suggestion_label = Gtk.Label(
+            label="Selecione uma posição salva para procurar a janela correspondente.",
+            xalign=0,
+            wrap=True,
+        )
+        self._match_suggestion_label.add_css_class("dim-label")
+        self._details_box.append(self._match_suggestion_label)
+
+        self._select_suggested_button = Gtk.Button(label="Selecionar janela sugerida")
+        self._select_suggested_button.set_sensitive(False)
+        self._select_suggested_button.connect("clicked", self._on_select_suggested_clicked)
+        self._details_box.append(self._select_suggested_button)
+
         self._restore_button = Gtk.Button(label="Restaurar posição")
         self._restore_button.set_sensitive(False)
         self._restore_button.connect("clicked", self._on_restore_clicked)
@@ -198,9 +213,11 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._loading = True
         self._selected_record = None
+        self._clear_match_suggestion()
         self._list_box.unselect_all()
         self._update_action_sensitivity()
         self._status_label.set_text("Carregando janelas...")
+        self._update_match_suggestion()
         self._show_empty_details()
 
         thread = threading.Thread(target=self._load_windows_worker, daemon=True)
@@ -238,6 +255,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._populate_window_list(records)
         self._list_box.unselect_all()
         self._selected_record = None
+        self._clear_match_suggestion()
+        self._update_match_suggestion()
         self._update_action_sensitivity()
         if self._status_after_refresh:
             self._status_label.set_text(self._status_after_refresh)
@@ -425,10 +444,12 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._saved_positions_dropdown.set_sensitive(not self._restoring)
 
+        self._update_match_suggestion()
         self._update_action_sensitivity()
 
     def _on_saved_position_selected(self, dropdown, _param):
         self._set_selected_saved_position_by_index(dropdown.get_selected())
+        self._update_match_suggestion()
         self._update_action_sensitivity()
 
     def _set_selected_saved_position_by_index(self, selected_index):
@@ -438,6 +459,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._saved_position_summary.set_text("Selecione uma posição salva")
             else:
                 self._saved_position_summary.set_text("Nenhuma posição salva")
+            self._clear_match_suggestion()
             return
 
         self._selected_saved_position = self._saved_positions[selected_index - 1]
@@ -458,6 +480,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._refresh_button.set_sensitive(not busy)
         self._save_button.set_sensitive(self._selected_record is not None and not busy)
         self._restore_button.set_sensitive(self._can_restore())
+        self._select_suggested_button.set_sensitive(self._can_select_suggested_window())
         self._saved_positions_dropdown.set_sensitive(
             bool(self._saved_positions) and not self._restoring
         )
@@ -469,6 +492,14 @@ class MainWindow(Adw.ApplicationWindow):
             and not self._loading
             and not self._restoring
             and self._has_valid_restore_target()
+        )
+
+    def _can_select_suggested_window(self):
+        return (
+            self._suggested_match is not None
+            and self._selected_saved_position is not None
+            and not self._loading
+            and not self._restoring
         )
 
     def _has_valid_restore_target(self):
@@ -520,6 +551,111 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.set_response_appearance("restaurar", Adw.ResponseAppearance.SUGGESTED)
         dialog.connect("response", self._on_restore_dialog_response)
         dialog.present()
+
+    def _update_match_suggestion(self):
+        self._clear_match_suggestion()
+
+        if self._selected_saved_position is None:
+            self._match_suggestion_label.set_text(
+                "Selecione uma posição salva para procurar a janela correspondente."
+            )
+            self._update_action_sensitivity()
+            return
+
+        if self._loading:
+            self._match_suggestion_label.set_text("Aguardando o carregamento das janelas...")
+            self._update_action_sensitivity()
+            return
+
+        if not self._records:
+            self._match_suggestion_label.set_text(
+                "Nenhuma janela aberta disponível para correspondência."
+            )
+            self._update_action_sensitivity()
+            return
+
+        try:
+            result = find_best_window_match(
+                self._selected_saved_position,
+                [record["window"] for record in self._records],
+            )
+        except WindowMatchingError as error:
+            self._match_suggestion_label.set_text(
+                f"Não foi possível analisar a correspondência: {error}"
+            )
+            self._update_action_sensitivity()
+            return
+        except Exception as error:
+            self._match_suggestion_label.set_text(
+                f"Erro ao analisar a correspondência: {error}"
+            )
+            self._update_action_sensitivity()
+            return
+
+        status = result.get("status")
+        if status == "matched":
+            candidate = result["best"]
+            window = candidate["window"]
+            app = candidate["application"]
+            self._suggested_match = candidate
+            self._match_suggestion_label.set_text(
+                "Janela sugerida: "
+                f"{app.get('resolved', '')} — {window.get('title', '')} · "
+                f"confiança {candidate.get('confidence', '')} · "
+                f"{candidate.get('score', 0)} pontos"
+            )
+        elif status == "ambiguous":
+            self._match_suggestion_label.set_text(
+                "Correspondência ambígua: os melhores candidatos estão próximos demais."
+            )
+        elif status == "not_found":
+            self._match_suggestion_label.set_text("Nenhuma correspondência segura encontrada.")
+        else:
+            self._match_suggestion_label.set_text(
+                "Erro ao analisar a correspondência: status desconhecido."
+            )
+
+        self._update_action_sensitivity()
+
+    def _clear_match_suggestion(self):
+        self._suggested_match = None
+        if hasattr(self, "_select_suggested_button"):
+            self._select_suggested_button.set_sensitive(False)
+
+    def _on_select_suggested_clicked(self, _button):
+        if not self._can_select_suggested_window():
+            return
+
+        suggested_sequence = str(
+            self._suggested_match["window"].get("stableSequence", "")
+        ).strip()
+        if not suggested_sequence:
+            self._handle_missing_suggested_window()
+            return
+
+        row = self._find_window_row_by_stable_sequence(suggested_sequence)
+        if row is None:
+            self._handle_missing_suggested_window()
+            return
+
+        self._list_box.select_row(row)
+
+    def _find_window_row_by_stable_sequence(self, stable_sequence):
+        row = self._list_box.get_first_child()
+        while row is not None:
+            current_sequence = str(row.window_data.get("stableSequence", "")).strip()
+            if current_sequence == stable_sequence:
+                return row
+            row = row.get_next_sibling()
+
+        return None
+
+    def _handle_missing_suggested_window(self):
+        self._clear_match_suggestion()
+        self._match_suggestion_label.set_text(
+            "A janela sugerida não está mais disponível. Atualize a lista."
+        )
+        self._update_action_sensitivity()
 
     def _on_restore_dialog_response(self, _dialog, response):
         if response != "restaurar":
