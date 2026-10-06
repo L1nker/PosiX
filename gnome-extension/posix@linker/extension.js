@@ -305,7 +305,7 @@ export default class PosiXExtension extends Extension {
     _launchApp() {
         try {
             const proc = new Gio.Subprocess({
-                argv: ['bash', '-c', 'PYTHONPATH=/home/linker/GoogleDrive/AG_Projects/PosiX/src python3 -m posix_app'],
+                argv: ['bash', '-c', 'PYTHONPATH=/home/linker/AG_Local/PosiX/src python3 -m posix_app'],
                 flags: Gio.SubprocessFlags.NONE,
             });
             proc.init(null);
@@ -358,7 +358,7 @@ export default class PosiXExtension extends Extension {
             const escapedTitle = rawTitle.replace(/'/g, "\\'");
             const monitor = win.get_monitor();
 
-            const cmd = `PYTHONPATH=/home/linker/GoogleDrive/AG_Projects/PosiX/src python3 -c "from posix_app.storage import create_manual_preset; create_manual_preset('${escapedTitle}', ${frame.width}, ${frame.height}, ${frame.x}, ${frame.y}, ${monitor})"`;
+            const cmd = `PYTHONPATH=/home/linker/AG_Local/PosiX/src python3 -c "from posix_app.storage import create_manual_preset; create_manual_preset('${escapedTitle}', ${frame.width}, ${frame.height}, ${frame.x}, ${frame.y}, ${monitor})"`;
 
             const proc = new Gio.Subprocess({
                 argv: ['bash', '-c', cmd],
@@ -376,7 +376,7 @@ export default class PosiXExtension extends Extension {
 
     _organizeAllWindows() {
         try {
-            const cmd = `PYTHONPATH=/home/linker/GoogleDrive/AG_Projects/PosiX/src python3 -c '
+            const cmd = `PYTHONPATH=/home/linker/AG_Local/PosiX/src python3 -c '
 import json
 from posix_app.storage import list_window_rules, list_saved_positions
 from posix_app.rules_engine import plan_window_organization
