@@ -36,6 +36,10 @@ BROWSER_TITLE_SUFFIXES = (
     " - Mozilla Firefox",
     " — Brave",
     " - Brave",
+    " - Google Chrome",
+    " — Google Chrome",
+    " - Chromium",
+    " — Chromium",
 )
 
 APP_IDENTITY_ALIASES = {
@@ -44,16 +48,32 @@ APP_IDENTITY_ALIASES = {
     "brave browser": "brave",
     "firefox": "firefox",
     "mozilla firefox": "firefox",
+    "google chrome": "google-chrome",
+    "chrome": "google-chrome",
+    "chromium": "chromium",
+    "chromium web browser": "chromium",
     "telegram": "telegram",
     "telegram desktop": "telegram",
     "discord": "discord",
+    "visual studio code": "vscode",
+    "code": "vscode",
+    "vs code": "vscode",
+    "cursor": "cursor",
+    "spotify": "spotify",
+    "slack": "slack",
+    "obsidian": "obsidian",
     "terminal": "terminal",
     "gnome terminal": "terminal",
     "editor de texto": "editor-de-texto",
     "gnome text editor": "editor-de-texto",
+    "gedit": "editor-de-texto",
     "arquivos": "arquivos",
     "files": "arquivos",
     "nautilus": "arquivos",
+    "vlc": "vlc",
+    "vlc media player": "vlc",
+    "gimp": "gimp",
+    "libreoffice": "libreoffice",
 }
 
 

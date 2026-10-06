@@ -6,11 +6,23 @@ import os
 KNOWN_APPS = [
     (("brave", "brave-browser"), "Brave"),
     (("firefox",), "Firefox"),
+    (("google-chrome", "chrome"), "Google Chrome"),
+    (("chromium", "chromium-browser"), "Chromium"),
     (("telegram-desktop", "telegram"), "Telegram"),
     (("discord",), "Discord"),
+    (("code", "code-oss", "visual-studio-code"), "VS Code"),
+    (("cursor",), "Cursor"),
+    (("spotify",), "Spotify"),
+    (("slack",), "Slack"),
+    (("obsidian",), "Obsidian"),
     (("gnome-terminal",), "Terminal"),
     (("gnome-text-editor",), "Editor de Texto"),
     (("nautilus",), "Arquivos"),
+    (("vlc",), "VLC"),
+    (("gimp",), "GIMP"),
+    (("soffice.bin", "libreoffice"), "LibreOffice"),
+    (("gnome-calculator", "calculator"), "Calculadora"),
+    (("gnome-system-monitor",), "Monitor do Sistema"),
 ]
 
 
