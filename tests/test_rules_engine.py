@@ -106,6 +106,25 @@ class TestRulesEngine(unittest.TestCase):
         self.assertEqual(plan[1]["target_x"], 1360)
         self.assertEqual(plan[1]["target_y"], 720)
 
+    def test_plan_with_dont_resize_rule(self):
+        rule_move_only = {
+            "id": 99,
+            "name": "Mover Apenas",
+            "position_id": 99,
+            "match_app": "firefox",
+            "is_active": True,
+            "dont_resize": True,
+            "global_x": 500,
+            "global_y": 300,
+        }
+        plan = plan_window_organization([self.firefox_whatsapp], [rule_move_only])
+        self.assertEqual(len(plan), 1)
+        # Deve manter a largura e altura da própria janela
+        self.assertEqual(plan[0]["target_width"], self.firefox_whatsapp["frame"]["width"])
+        self.assertEqual(plan[0]["target_height"], self.firefox_whatsapp["frame"]["height"])
+        self.assertEqual(plan[0]["target_x"], 500)
+        self.assertEqual(plan[0]["target_y"], 300)
+
 
 if __name__ == "__main__":
     unittest.main()

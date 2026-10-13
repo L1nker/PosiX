@@ -90,18 +90,29 @@ def plan_window_organization(windows, rules, positions=None):
 
         pos_id = rule.get("position_id")
         pos_data = positions_by_id.get(pos_id) or rule
-
-        target_width = pos_data.get("width")
-        target_height = pos_data.get("height")
-        if not target_width or not target_height:
-            continue
-
         frame = win.get("frame") or {}
+
+        dont_resize = bool(pos_data.get("dont_resize"))
+        dont_move = bool(pos_data.get("dont_move"))
+
+        if dont_resize:
+            target_width = frame.get("width", 800)
+            target_height = frame.get("height", 600)
+        else:
+            target_width = pos_data.get("width")
+            target_height = pos_data.get("height")
+            if not target_width or not target_height:
+                continue
+
         gx = pos_data.get("global_x")
         gy = pos_data.get("global_y")
 
-        target_x = gx if gx is not None else frame.get("x", 100)
-        target_y = gy if gy is not None else frame.get("y", 100)
+        if dont_move:
+            target_x = frame.get("x", 100)
+            target_y = frame.get("y", 100)
+        else:
+            target_x = gx if gx is not None else frame.get("x", 100)
+            target_y = gy if gy is not None else frame.get("y", 100)
 
         used_sequences.add(seq)
         actions.append({

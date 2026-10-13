@@ -45,6 +45,14 @@ export default class PosiXExtension extends Extension {
         this._origBuildMenu = null;
         this._indicator = null;
 
+        this._osdBin = null;
+        this._osdLabel = null;
+        this._activeGrabWindow = null;
+        this._windowMoveId = 0;
+        this._windowSizeId = 0;
+        this._grabBeginId = 0;
+        this._grabEndId = 0;
+
         this._log('extensão habilitada');
 
         this._ownerId = Gio.bus_own_name(
@@ -58,11 +66,13 @@ export default class PosiXExtension extends Extension {
 
         this._patchWindowMenu();
         this._initIndicator();
+        this._initOsd();
     }
 
     disable() {
         this._unpatchWindowMenu();
         this._destroyIndicator();
+        this._destroyOsd();
 
         if (this._dbusObject) {
             this._dbusObject.flush();
@@ -77,6 +87,118 @@ export default class PosiXExtension extends Extension {
 
         this._connection = null;
         this._log('extensão desabilitada');
+    }
+
+    _initOsd() {
+        try {
+            this._grabBeginId = global.display.connect('grab-op-begin', (_display, window, _op) => {
+                this._onGrabBegin(window);
+            });
+            this._grabEndId = global.display.connect('grab-op-end', (_display, _window, _op) => {
+                this._onGrabEnd();
+            });
+        } catch (err) {
+            this._log(`Aviso ao conectar sinais de grab-op: ${err.message}`);
+        }
+    }
+
+    _destroyOsd() {
+        try {
+            if (this._grabBeginId) {
+                global.display.disconnect(this._grabBeginId);
+                this._grabBeginId = 0;
+            }
+            if (this._grabEndId) {
+                global.display.disconnect(this._grabEndId);
+                this._grabEndId = 0;
+            }
+            this._onGrabEnd();
+        } catch (_) {}
+    }
+
+    _onGrabBegin(window) {
+        try {
+            const settings = this._loadSettings();
+            const mode = settings.tooltip_mode || 'pos_size';
+            if (mode === 'none' || !window || typeof window.get_frame_rect !== 'function')
+                return;
+
+            this._activeGrabWindow = window;
+            this._updateOsd(window, mode);
+
+            this._windowMoveId = window.connect('position-changed', () => {
+                this._updateOsd(window, mode);
+            });
+            this._windowSizeId = window.connect('size-changed', () => {
+                this._updateOsd(window, mode);
+            });
+        } catch (err) {
+            this._log(`Erro em _onGrabBegin: ${err.message}`);
+        }
+    }
+
+    _onGrabEnd() {
+        try {
+            if (this._activeGrabWindow) {
+                if (this._windowMoveId) {
+                    this._activeGrabWindow.disconnect(this._windowMoveId);
+                    this._windowMoveId = 0;
+                }
+                if (this._windowSizeId) {
+                    this._activeGrabWindow.disconnect(this._windowSizeId);
+                    this._windowSizeId = 0;
+                }
+                this._activeGrabWindow = null;
+            }
+
+            if (this._osdBin) {
+                this._osdBin.destroy();
+                this._osdBin = null;
+                this._osdLabel = null;
+            }
+        } catch (err) {
+            this._log(`Erro em _onGrabEnd: ${err.message}`);
+        }
+    }
+
+    _updateOsd(window, mode) {
+        try {
+            if (!this._osdBin) {
+                this._osdBin = new St.Bin({
+                    style_class: 'posix-osd-panel',
+                    style: 'background-color: rgba(20, 20, 24, 0.92); color: #ffffff; border: 1px solid rgba(255, 255, 255, 0.22); border-radius: 10px; padding: 6px 14px; box-shadow: 0 4px 16px rgba(0,0,0,0.55);',
+                    reactive: false,
+                    can_focus: false,
+                });
+                this._osdLabel = new St.Label({
+                    style: 'color: #ffffff; font-size: 13px; font-weight: 700; font-family: sans-serif;',
+                    text: '',
+                });
+                this._osdBin.set_child(this._osdLabel);
+                Main.uiGroup.add_child(this._osdBin);
+            }
+
+            const frame = window.get_frame_rect();
+            const mon = window.get_monitor();
+            let msg = '';
+            if (mode === 'size') {
+                msg = `📐 ${frame.width} × ${frame.height} px`;
+            } else if (mode === 'pos') {
+                msg = `📍 X: ${frame.x}, Y: ${frame.y}  (Monitor ${mon + 1})`;
+            } else {
+                msg = `📍 X: ${frame.x}, Y: ${frame.y}   •   📐 ${frame.width} × ${frame.height} px   •   Monitor ${mon + 1}`;
+            }
+            this._osdLabel.set_text(msg);
+
+            const monitor = Main.layoutManager.monitors[mon] || Main.layoutManager.primaryMonitor;
+            const [, natW] = this._osdBin.get_preferred_width(-1);
+            const osdW = natW || 260;
+            this._osdBin.set_position(
+                monitor.x + Math.max(20, Math.round((monitor.width - osdW) / 2)),
+                monitor.y + 40
+            );
+            this._osdBin.show();
+        } catch (_) {}
     }
 
     _patchWindowMenu() {
@@ -115,9 +237,8 @@ export default class PosiXExtension extends Extension {
             if (!window || typeof window.get_frame_rect !== 'function')
                 return;
 
-            const presets = this._loadPresets();
-            if (!Array.isArray(presets))
-                return;
+            const data = this._loadPresetsData();
+            const presets = data.presets || [];
 
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -141,7 +262,7 @@ export default class PosiXExtension extends Extension {
             subMenu.menu.addMenuItem(organizeItem);
 
             // 2. Salvar Posição Desta Janela
-            const saveCurrentItem = new PopupMenu.PopupMenuItem('💾 Salvar Posição Desta Janela');
+            const saveCurrentItem = new PopupMenu.PopupMenuItem('💾 Salvar Posição Desta Janela...');
             saveCurrentItem.connect('activate', () => {
                 try {
                     menu.close();
@@ -159,26 +280,7 @@ export default class PosiXExtension extends Extension {
 
             if (presets.length > 0) {
                 subMenu.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-                for (const preset of presets) {
-                    if (!preset || !preset.width || !preset.height) continue;
-                    const label = `${preset.name || 'Tamanho'} (${preset.width}×${preset.height})`;
-                    const item = new PopupMenu.PopupMenuItem(label);
-                    item.connect('activate', () => {
-                        try {
-                            menu.close();
-                        } catch (_) {}
-                        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                            try {
-                                this._applyPresetToWindow(window, preset);
-                            } catch (e) {
-                                this._log(`Erro ao aplicar preset: ${e.message}`);
-                            }
-                            return GLib.SOURCE_REMOVE;
-                        });
-                    });
-                    subMenu.menu.addMenuItem(item);
-                }
+                this._populateMenuWithPresets(subMenu.menu, data, window, menu);
             }
 
             menu.addMenuItem(subMenu);
@@ -187,13 +289,86 @@ export default class PosiXExtension extends Extension {
         }
     }
 
-    _loadPresets() {
+    _populateMenuWithPresets(menuTarget, data, targetWindow, parentMenuToClose = null) {
+        const presets = data.presets || [];
+        const groups = data.groups || [];
+
+        // Itens soltos (sem grupo)
+        const rootPresets = presets.filter(p => !p.group);
+        // Itens agrupados por pasta
+        const groupedMap = {};
+        for (const g of groups) {
+            groupedMap[g] = [];
+        }
+        for (const p of presets) {
+            if (p.group) {
+                if (!groupedMap[p.group])
+                    groupedMap[p.group] = [];
+                groupedMap[p.group].push(p);
+            }
+        }
+
+        const createItem = (preset) => {
+            let label = preset.name || 'Posição';
+            if (preset.dont_resize) {
+                label = `${label} (Apenas Mover)`;
+            } else if (preset.dont_move) {
+                label = `${label} (${preset.width}×${preset.height} - Fixo)`;
+            } else if (preset.width && preset.height) {
+                label = `${label} (${preset.width}×${preset.height})`;
+            }
+
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.connect('activate', () => {
+                if (parentMenuToClose) {
+                    try { parentMenuToClose.close(); } catch (_) {}
+                }
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    try {
+                        if (targetWindow) {
+                            this._applyPresetToWindow(targetWindow, preset);
+                        } else {
+                            this._applyPresetToActiveWindow(preset);
+                        }
+                    } catch (e) {
+                        this._log(`Erro ao aplicar preset: ${e.message}`);
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+            return item;
+        };
+
+        // Adiciona itens soltos da raiz
+        for (const p of rootPresets) {
+            menuTarget.addMenuItem(createItem(p));
+        }
+
+        // Adiciona grupos como submenus
+        const groupNames = Object.keys(groupedMap).sort();
+        if (groupNames.length > 0 && rootPresets.length > 0) {
+            menuTarget.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        }
+
+        for (const gName of groupNames) {
+            const list = groupedMap[gName];
+            if (!list || list.length === 0) continue;
+
+            const groupSub = new PopupMenu.PopupSubMenuMenuItem(`📁 ${gName}`);
+            for (const p of list) {
+                groupSub.menu.addMenuItem(createItem(p));
+            }
+            menuTarget.addMenuItem(groupSub);
+        }
+    }
+
+    _loadPresetsData() {
         try {
             const dataDir = GLib.get_user_data_dir();
             const filePath = `${dataDir}/posix/presets.json`;
             const file = Gio.File.new_for_path(filePath);
             if (!file.query_exists(null))
-                return this._fallbackPresets();
+                return {presets: this._fallbackPresets(), groups: [], settings: {}};
 
             const [, contents] = file.load_contents(null);
             const decoder = new TextDecoder('utf-8');
@@ -201,14 +376,23 @@ export default class PosiXExtension extends Extension {
             const data = JSON.parse(jsonText);
 
             if (Array.isArray(data))
-                return data;
+                return {presets: data, groups: [], settings: {}};
 
             if (data && Array.isArray(data.presets))
-                return data.presets;
+                return data;
 
-            return this._fallbackPresets();
+            return {presets: this._fallbackPresets(), groups: [], settings: {}};
         } catch (_error) {
-            return this._fallbackPresets();
+            return {presets: this._fallbackPresets(), groups: [], settings: {}};
+        }
+    }
+
+    _loadSettings() {
+        try {
+            const data = this._loadPresetsData();
+            return data.settings || {};
+        } catch (_) {
+            return {};
         }
     }
 
@@ -249,56 +433,42 @@ export default class PosiXExtension extends Extension {
     }
 
     _refreshIndicatorMenu() {
-        if (!this._indicator || !this._indicator.menu)
-            return;
+        if (!this._indicator) return;
 
         this._indicator.menu.removeAll();
 
-        // 1. Organizar Janelas (Destaque Principal)
-        const organizeItem = new PopupMenu.PopupMenuItem('⚡ Organizar Janelas');
+        // 1. Abrir PosiX
+        const openAppItem = new PopupMenu.PopupMenuItem('⚙️ Painel PosiX...');
+        openAppItem.connect('activate', () => {
+            this._launchApp();
+        });
+        this._indicator.menu.addMenuItem(openAppItem);
+
+        // 2. Organizar Todas as Janelas
+        const organizeItem = new PopupMenu.PopupMenuItem('⚡ Organizar Janelas Agora');
         organizeItem.connect('activate', () => {
-            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                this._organizeAllWindows();
-                return GLib.SOURCE_REMOVE;
-            });
+            this._organizeAllWindows();
         });
         this._indicator.menu.addMenuItem(organizeItem);
 
-        // 2. Salvar Posição da Janela Ativa
-        const saveActiveItem = new PopupMenu.PopupMenuItem('💾 Salvar Posição da Janela Ativa');
-        saveActiveItem.connect('activate', () => {
-            const focusWindow = global.display.focus_window;
-            if (focusWindow) {
-                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                    this._saveWindowAsPreset(focusWindow);
-                    return GLib.SOURCE_REMOVE;
-                });
+        // 3. Salvar Janela Ativa
+        const saveFocusItem = new PopupMenu.PopupMenuItem('💾 Salvar Janela em Foco...');
+        saveFocusItem.connect('activate', () => {
+            const focusWin = global.display.focus_window;
+            if (focusWin) {
+                this._saveWindowAsPreset(focusWin);
             } else {
-                Main.notify('PosiX', 'Nenhuma janela em foco para capturar.');
+                Main.notify('PosiX', 'Nenhuma janela ativa em foco para salvar.');
             }
         });
-        this._indicator.menu.addMenuItem(saveActiveItem);
+        this._indicator.menu.addMenuItem(saveFocusItem);
 
-        // 3. Abrir App PosiX
-        const openItem = new PopupMenu.PopupMenuItem('Abrir Painel PosiX');
-        openItem.connect('activate', () => {
-            this._launchApp();
-        });
-        this._indicator.menu.addMenuItem(openItem);
+        const data = this._loadPresetsData();
+        const presets = data.presets || [];
 
-        this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-        const sectionHeader = new PopupMenu.PopupMenuItem('Redimensionar Janela Ativa:', {reactive: false});
-        this._indicator.menu.addMenuItem(sectionHeader);
-
-        const presets = this._loadPresets();
-        for (const preset of presets) {
-            const label = `  ${preset.name || 'Tamanho'} (${preset.width}×${preset.height})`;
-            const item = new PopupMenu.PopupMenuItem(label);
-            item.connect('activate', () => {
-                this._applyPresetToActiveWindow(preset);
-            });
-            this._indicator.menu.addMenuItem(item);
+        if (presets.length > 0) {
+            this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            this._populateMenuWithPresets(this._indicator.menu, data, null, null);
         }
     }
 
@@ -325,15 +495,25 @@ export default class PosiXExtension extends Extension {
                 win.unmaximize(Meta.MaximizeFlags.BOTH);
 
             const frame = win.get_frame_rect();
-            const targetX = (preset.global_x !== null && preset.global_x !== undefined) ? preset.global_x : frame.x;
-            const targetY = (preset.global_y !== null && preset.global_y !== undefined) ? preset.global_y : frame.y;
+            const targetX = preset.dont_move
+                ? frame.x
+                : ((preset.global_x !== null && preset.global_x !== undefined) ? preset.global_x : frame.x);
+            const targetY = preset.dont_move
+                ? frame.y
+                : ((preset.global_y !== null && preset.global_y !== undefined) ? preset.global_y : frame.y);
+            const targetW = preset.dont_resize
+                ? frame.width
+                : ((preset.width !== null && preset.width !== undefined) ? preset.width : frame.width);
+            const targetH = preset.dont_resize
+                ? frame.height
+                : ((preset.height !== null && preset.height !== undefined) ? preset.height : frame.height);
 
             // Descola com user_op = false para janelas restritas como PiP
             try {
                 win.move_frame(false, targetX, targetY);
             } catch (_) {}
 
-            win.move_resize_frame(false, targetX, targetY, preset.width, preset.height);
+            win.move_resize_frame(false, targetX, targetY, targetW, targetH);
         } catch (e) {
             this._log(`Erro ao redimensionar janela: ${e.message}`);
         }
@@ -587,32 +767,72 @@ print(len(plan))
             () => metaWindow.get_frame_rect(),
             null
         ));
-        const difference = {
-            x: after.x - requested.x,
-            y: after.y - requested.y,
-            width: after.width - requested.width,
-            height: after.height - requested.height,
-        };
+
         const exact = (
-            difference.x === 0 &&
-            difference.y === 0 &&
-            difference.width === 0 &&
-            difference.height === 0
+            after.x === requested.x &&
+            after.y === requested.y &&
+            after.width === requested.width &&
+            after.height === requested.height
         );
 
         return {
             success: true,
             stableSequence: sequence,
-            before,
+            title: this._safeCall(() => metaWindow.get_title(), ''),
             requested,
+            before,
             after,
-            difference,
             exact,
-            error: '',
+            error: null,
         };
     }
 
+    _serializeWindow(metaWindow, stableSequence) {
+        const frameRect = this._safeCall(() => metaWindow.get_frame_rect(), null);
+        const bufferRect = this._safeCall(() => metaWindow.get_buffer_rect(), null);
+        const monitorIndex = this._safeCall(() => metaWindow.get_monitor(), 0);
+        const workspaceIndex = this._safeCall(
+            () => metaWindow.get_workspace()?.index() ?? 0,
+            0
+        );
+
+        const frame = this._geometryFromRect(frameRect);
+        const buffer = this._geometryFromRect(bufferRect);
+
+        return {
+            stableSequence,
+            title: this._safeCall(() => metaWindow.get_title(), ''),
+            wmClass: this._safeCall(() => metaWindow.get_wm_class(), ''),
+            wmClassInstance: this._safeCall(() => metaWindow.get_wm_class_instance(), ''),
+            pid: this._safeCall(() => metaWindow.get_pid(), 0),
+            appId: this._safeCall(() => metaWindow.get_gtk_application_id(), ''),
+            appName: this._resolveAppName(metaWindow),
+            monitorIndex,
+            workspaceIndex,
+            frame,
+            buffer,
+            relative: {
+                x: frame.x,
+                y: frame.y,
+            },
+            isMaximized: this._safeCall(() => metaWindow.get_maximized() !== 0, false),
+            isFullscreen: this._safeCall(() => metaWindow.is_fullscreen(), false),
+            isActive: this._safeCall(() => metaWindow.has_focus(), false),
+        };
+    }
+
+    _resolveAppName(metaWindow) {
+        const tracker = Shell.WindowTracker.get_default();
+        const app = this._safeCall(() => tracker.get_window_app(metaWindow), null);
+
+        if (!app)
+            return '';
+
+        return this._safeCall(() => app.get_name(), '');
+    }
+
     _findWindowByStableSequence(stableSequence) {
+        const targetSequence = String(stableSequence ?? '').trim();
         const actors = this._safeCall(() => global.get_window_actors(), []);
 
         for (const actor of actors) {
@@ -623,8 +843,9 @@ print(len(plan))
             const currentSequence = String(this._safeCall(
                 () => metaWindow.get_stable_sequence(),
                 ''
-            ));
-            if (currentSequence === stableSequence)
+            )).trim();
+
+            if (currentSequence === targetSequence)
                 return metaWindow;
         }
 
@@ -633,18 +854,16 @@ print(len(plan))
 
     _validateMoveResizeRequest(stableSequence, requested) {
         if (!stableSequence)
-            throw new Error('stableSequence não pode ser vazia.');
+            throw new Error('A stableSequence da janela deve ser informada.');
 
-        for (const key of ['x', 'y', 'width', 'height']) {
-            if (!Number.isFinite(requested[key]) || !Number.isInteger(requested[key]))
-                throw new Error(`Valor inválido para ${key}.`);
-        }
+        if (!Number.isInteger(requested.x) || !Number.isInteger(requested.y))
+            throw new Error('As coordenadas x e y devem ser números inteiros.');
 
-        if (requested.width <= 0)
-            throw new Error('width deve ser maior que zero.');
+        if (!Number.isInteger(requested.width) || !Number.isInteger(requested.height))
+            throw new Error('A largura e altura devem ser números inteiros.');
 
-        if (requested.height <= 0)
-            throw new Error('height deve ser maior que zero.');
+        if (requested.width <= 0 || requested.height <= 0)
+            throw new Error('A largura e altura devem ser maiores que zero.');
     }
 
     _requestedGeometry(x, y, width, height) {
@@ -656,106 +875,15 @@ print(len(plan))
         };
     }
 
-    _moveResizeFailure(stableSequence, requested, error) {
-        return {
-            success: false,
-            stableSequence,
-            before: null,
-            requested,
-            after: null,
-            difference: null,
-            exact: false,
-            error,
-        };
-    }
-
-    _serializeWindow(metaWindow, stableSequence) {
-        const monitorIndex = this._safeCall(() => metaWindow.get_monitor(), -1);
-        const frame = this._geometryFromRect(this._safeCall(
-            () => metaWindow.get_frame_rect(),
-            null
-        ));
-        const monitor = this._getMonitorGeometry(monitorIndex);
-        const workArea = this._getWorkArea(metaWindow, monitorIndex);
-        const app = this._getWindowApp(metaWindow);
-
-        return {
-            stableSequence,
-            title: this._safeCall(() => metaWindow.get_title(), ''),
-            wmClass: this._safeCall(() => metaWindow.get_wm_class(), ''),
-            wmClassInstance: this._safeCall(() => metaWindow.get_wm_class_instance(), ''),
-            pid: this._safeCall(() => metaWindow.get_pid(), -1),
-            appId: app.id,
-            appName: app.name,
-            monitorIndex,
-            workspaceIndex: this._getWorkspaceIndex(metaWindow),
-            frame,
-            monitor,
-            workArea,
-            relative: {
-                x: frame.x - monitor.x,
-                y: frame.y - monitor.y,
-            },
-            state: {
-                maximized: this._safeCall(() => metaWindow.get_maximized(), 0) !== 0,
-                fullscreen: this._safeCall(() => metaWindow.is_fullscreen(), false),
-                minimized: this._safeCall(() => metaWindow.minimized, false),
-                allowsMove: this._safeCall(() => metaWindow.allows_move(), false),
-                allowsResize: this._safeCall(() => metaWindow.allows_resize(), false),
-                skipTaskbar: this._safeCall(() => metaWindow.is_skip_taskbar(), false),
-            },
-            windowType: this._safeCall(() => metaWindow.get_window_type(), -1),
-        };
-    }
-
-    _getWindowApp(metaWindow) {
-        const tracker = this._safeCall(() => Shell.WindowTracker.get_default(), null);
-        const app = tracker ? this._safeCall(() => tracker.get_window_app(metaWindow), null) : null;
-
-        return {
-            id: app ? this._safeCall(() => app.get_id(), '') : '',
-            name: app ? this._safeCall(() => app.get_name(), '') : '',
-        };
-    }
-
-    _getWorkspaceIndex(metaWindow) {
-        const workspace = this._safeCall(() => metaWindow.get_workspace(), null);
-
-        if (!workspace)
-            return -1;
-
-        return this._safeCall(() => workspace.index(), -1);
-    }
-
-    _getMonitorGeometry(monitorIndex) {
-        if (monitorIndex < 0)
-            return this._emptyGeometry();
-
-        return this._geometryFromRect(this._safeCall(
-            () => global.display.get_monitor_geometry(monitorIndex),
-            null
-        ));
-    }
-
-    _getWorkArea(metaWindow, monitorIndex) {
-        if (monitorIndex < 0)
-            return this._emptyGeometry();
-
-        const workspace = this._safeCall(() => metaWindow.get_workspace(), null);
-
-        if (workspace && typeof workspace.get_work_area_for_monitor === 'function') {
-            return this._geometryFromRect(this._safeCall(
-                () => workspace.get_work_area_for_monitor(monitorIndex),
-                null
-            ));
-        }
-
-        return this._emptyGeometry();
-    }
-
     _geometryFromRect(rect) {
-        if (!rect)
-            return this._emptyGeometry();
+        if (!rect) {
+            return {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            };
+        }
 
         return {
             x: Number(rect.x ?? 0),
@@ -765,21 +893,24 @@ print(len(plan))
         };
     }
 
-    _emptyGeometry() {
+    _moveResizeFailure(stableSequence, requested, errorMessage) {
         return {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
+            success: false,
+            stableSequence,
+            title: '',
+            requested,
+            before: this._geometryFromRect(null),
+            after: this._geometryFromRect(null),
+            exact: false,
+            error: errorMessage,
         };
     }
 
-    _safeCall(callback, fallback) {
+    _safeCall(action, fallbackValue) {
         try {
-            const value = callback();
-            return value ?? fallback;
+            return action();
         } catch (_error) {
-            return fallback;
+            return fallbackValue;
         }
     }
 }

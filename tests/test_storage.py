@@ -193,6 +193,82 @@ class TestStorage(unittest.TestCase):
         rules_after_pos_delete = list_window_rules()
         self.assertEqual(len(rules_after_pos_delete), 0)
 
+    def test_groups_management(self):
+        from posix_app.storage import list_groups, rename_group, delete_group
+        
+        id1 = create_manual_preset("P1", 800, 600, group_name="Trabalho")
+        id2 = create_manual_preset("P2", 1024, 768, group_name="Trabalho")
+        id3 = create_manual_preset("P3", 1280, 720, group_name="Vídeos")
+        id4 = create_manual_preset("P4", 1920, 1080)  # raiz
+
+        groups = list_groups()
+        self.assertIn("Trabalho", groups)
+        self.assertIn("Vídeos", groups)
+        self.assertEqual(len(groups), 2)
+
+        # Renomeação de grupo
+        rename_group("Trabalho", "Produtividade")
+        groups = list_groups()
+        self.assertNotIn("Trabalho", groups)
+        self.assertIn("Produtividade", groups)
+
+        positions = list_saved_positions()
+        p1 = next(p for p in positions if p["id"] == id1)
+        self.assertEqual(p1["group_name"], "Produtividade")
+
+        # Exclusão de grupo mantendo itens (move para a raiz)
+        delete_group("Produtividade", remove_items=False)
+        positions = list_saved_positions()
+        p1_after = next(p for p in positions if p["id"] == id1)
+        self.assertIsNone(p1_after["group_name"])
+
+    def test_dont_resize_and_dont_move_presets(self):
+        # Preset que apenas move (dont_resize=True)
+        move_only_id = create_manual_preset("Canto Superior", global_x=100, global_y=50, dont_resize=True)
+        positions = list_saved_positions()
+        p = next(x for x in positions if x["id"] == move_only_id)
+        self.assertTrue(p["dont_resize"])
+        self.assertFalse(p["dont_move"])
+        self.assertEqual(p["global_x"], 100)
+        self.assertEqual(p["global_y"], 50)
+        self.assertIsNone(p["width"])
+        self.assertIsNone(p["height"])
+
+        # Preset que apenas redimensiona (dont_move=True)
+        size_only_id = create_manual_preset("Tamanho HD", width=1280, height=720, dont_move=True)
+        positions = list_saved_positions()
+        p_size = next(x for x in positions if x["id"] == size_only_id)
+        self.assertTrue(p_size["dont_move"])
+        self.assertFalse(p_size["dont_resize"])
+        self.assertEqual(p_size["width"], 1280)
+        self.assertEqual(p_size["height"], 720)
+        self.assertIsNone(p_size["global_x"])
+        self.assertIsNone(p_size["global_y"])
+
+    def test_app_settings_and_export(self):
+        from posix_app.storage import (
+            get_setting,
+            set_setting,
+            get_all_settings,
+            export_configuration_json,
+            import_configuration_json,
+        )
+
+        set_setting("tooltip_mode", "size")
+        self.assertEqual(get_setting("tooltip_mode"), "size")
+
+        settings = get_all_settings()
+        self.assertEqual(settings["tooltip_mode"], "size")
+
+        # Teste de exportação e importação
+        create_manual_preset("Backup Preset", 800, 600)
+        json_export = export_configuration_json()
+        self.assertIn("Backup Preset", json_export)
+
+        # Importa em base limpa
+        imported = import_configuration_json(json_export)
+        self.assertTrue(imported)
+
 
 if __name__ == "__main__":
     unittest.main()

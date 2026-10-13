@@ -1,4 +1,4 @@
-"""Persistência local de posições capturadas pelo PosiX."""
+"""Persistência local de posições, regras e configurações do PosiX."""
 
 import json
 import os
@@ -7,14 +7,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 class StorageError(Exception):
     """Erro ao acessar o armazenamento local do PosiX."""
 
 
-def save_window_position(window, application, name=None, preset_type="app_specific"):
+DEFAULT_SETTINGS = {
+    "tooltip_mode": "pos_size",  # 'pos_size', 'size', 'pos', 'none'
+    "adjust_opposite_edge": "0",  # '0' ou '1'
+    "compensate_frame_effects": "1",  # '0' ou '1'
+    "global_hotkey": "Ctrl+Super+Z",
+}
+
+
+def save_window_position(
+    window,
+    application,
+    name=None,
+    preset_type="universal",
+    group_name=None,
+    dont_resize=False,
+    dont_move=False,
+):
     """Salva uma captura local da janela e retorna o ID criado."""
     if not isinstance(window, dict):
         raise StorageError("A janela informada não é um dicionário.")
@@ -58,8 +74,12 @@ def save_window_position(window, application, name=None, preset_type="app_specif
                     width,
                     height,
                     snapshot_json,
-                    preset_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    preset_type,
+                    group_name,
+                    dont_resize,
+                    dont_move,
+                    sort_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name or _default_name(window, application),
@@ -73,14 +93,18 @@ def save_window_position(window, application, name=None, preset_type="app_specif
                     _int_or_none(window.get("pid")),
                     _int_or_none(window.get("monitorIndex")),
                     _int_or_none(window.get("workspaceIndex")),
-                    _int_or_none(_geometry(window, "frame").get("x")),
-                    _int_or_none(_geometry(window, "frame").get("y")),
-                    _int_or_none(_geometry(window, "relative").get("x")),
-                    _int_or_none(_geometry(window, "relative").get("y")),
-                    _int_or_none(_geometry(window, "frame").get("width")),
-                    _int_or_none(_geometry(window, "frame").get("height")),
+                    None if dont_move else _int_or_none(_geometry(window, "frame").get("x")),
+                    None if dont_move else _int_or_none(_geometry(window, "frame").get("y")),
+                    None if dont_move else _int_or_none(_geometry(window, "relative").get("x")),
+                    None if dont_move else _int_or_none(_geometry(window, "relative").get("y")),
+                    None if dont_resize else _int_or_none(_geometry(window, "frame").get("width")),
+                    None if dont_resize else _int_or_none(_geometry(window, "frame").get("height")),
                     snapshot_json,
-                    preset_type or "app_specific",
+                    preset_type or "universal",
+                    _text_or_none(group_name),
+                    1 if dont_resize else 0,
+                    1 if dont_move else 0,
+                    0,
                 ),
             )
             new_id = cursor.lastrowid
@@ -93,7 +117,7 @@ def save_window_position(window, application, name=None, preset_type="app_specif
 
 
 def list_saved_positions():
-    """Retorna as posições salvas da mais recente para a mais antiga."""
+    """Retorna as posições salvas ordenadas pela ordem de exibição."""
     database_path = get_database_path()
 
     if not database_path.exists():
@@ -125,9 +149,13 @@ def list_saved_positions():
                     width,
                     height,
                     snapshot_json,
-                    preset_type
+                    preset_type,
+                    group_name,
+                    dont_resize,
+                    dont_move,
+                    sort_order
                 FROM saved_positions
-                ORDER BY id DESC
+                ORDER BY sort_order ASC, id DESC
                 """
             ).fetchall()
             results = [dict(row) for row in rows]
@@ -137,8 +165,186 @@ def list_saved_positions():
         raise StorageError(f"Erro SQLite ao listar posições: {error}") from error
 
 
+def list_groups():
+    """Retorna a lista de nomes de grupos/pastas customizados cadastrados."""
+    database_path = get_database_path()
+    if not database_path.exists():
+        return []
+
+    try:
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT DISTINCT group_name
+                FROM saved_positions
+                WHERE group_name IS NOT NULL AND TRIM(group_name) != ''
+                ORDER BY group_name COLLATE NOCASE ASC
+                """
+            ).fetchall()
+            return [r[0] for r in rows if r[0]]
+    except sqlite3.Error as error:
+        raise StorageError(f"Erro SQLite ao listar grupos: {error}") from error
+
+
+def rename_group(old_name, new_name):
+    """Renomeia um grupo/pasta em todas as posições associadas."""
+    clean_old = _clean_text(old_name)
+    clean_new = _clean_text(new_name)
+    if not clean_old or not clean_new:
+        raise StorageError("Os nomes dos grupos não podem ser vazios.")
+
+    try:
+        database_path = get_database_path()
+        if not database_path.exists():
+            return False
+
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            cursor = connection.execute(
+                "UPDATE saved_positions SET group_name = ? WHERE group_name = ?",
+                (clean_new, clean_old),
+            )
+            connection.commit()
+            updated = cursor.rowcount > 0
+            if updated:
+                _sync_cache_files()
+            return updated
+    except sqlite3.Error as error:
+        raise StorageError(f"Erro SQLite ao renomear grupo: {error}") from error
+
+
+def delete_group(group_name, remove_items=False):
+    """Exclui um grupo. Se remove_items for False, move os itens para a raiz."""
+    clean_name = _clean_text(group_name)
+    if not clean_name:
+        return False
+
+    try:
+        database_path = get_database_path()
+        if not database_path.exists():
+            return False
+
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            if remove_items:
+                # Remove regras dependentes primeiro
+                connection.execute(
+                    "DELETE FROM window_rules WHERE position_id IN (SELECT id FROM saved_positions WHERE group_name = ?)",
+                    (clean_name,),
+                )
+                cursor = connection.execute(
+                    "DELETE FROM saved_positions WHERE group_name = ?",
+                    (clean_name,),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE saved_positions SET group_name = NULL WHERE group_name = ?",
+                    (clean_name,),
+                )
+            connection.commit()
+            affected = cursor.rowcount > 0
+            if affected:
+                _sync_cache_files()
+            return affected
+    except sqlite3.Error as error:
+        raise StorageError(f"Erro SQLite ao excluir grupo: {error}") from error
+
+
+def reorder_saved_position(position_id, direction="up"):
+    """Move uma posição para cima ou para baixo na ordem de exibição."""
+    val_id = _validate_position_id(position_id)
+    try:
+        database_path = get_database_path()
+        if not database_path.exists():
+            return False
+
+        with sqlite3.connect(database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            _ensure_schema(connection)
+            items = connection.execute(
+                "SELECT id, sort_order FROM saved_positions ORDER BY sort_order ASC, id DESC"
+            ).fetchall()
+            ids = [r["id"] for r in items]
+            if val_id not in ids:
+                return False
+
+            idx = ids.index(val_id)
+            if direction == "up" and idx > 0:
+                swap_idx = idx - 1
+            elif direction == "down" and idx < len(ids) - 1:
+                swap_idx = idx + 1
+            else:
+                return False
+
+            ids[idx], ids[swap_idx] = ids[swap_idx], ids[idx]
+            for order, item_id in enumerate(ids):
+                connection.execute(
+                    "UPDATE saved_positions SET sort_order = ? WHERE id = ?",
+                    (order, item_id),
+                )
+            connection.commit()
+            _sync_cache_files()
+            return True
+    except sqlite3.Error as error:
+        raise StorageError(f"Erro SQLite ao reordenar posição: {error}") from error
+
+
+def get_setting(key, default=None):
+    """Recupera uma configuração persistida do aplicativo."""
+    database_path = get_database_path()
+    if not database_path.exists():
+        return DEFAULT_SETTINGS.get(key, default)
+
+    try:
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            row = connection.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+            if row:
+                return row[0]
+            return DEFAULT_SETTINGS.get(key, default)
+    except sqlite3.Error:
+        return DEFAULT_SETTINGS.get(key, default)
+
+
+def set_setting(key, value):
+    """Define e persiste uma configuração do aplicativo."""
+    database_path = get_database_path()
+    try:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            connection.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(key), str(value)),
+            )
+            connection.commit()
+            _sync_cache_files()
+            return True
+    except sqlite3.Error as error:
+        raise StorageError(f"Erro SQLite ao salvar configuração: {error}") from error
+
+
+def get_all_settings():
+    """Retorna um dicionário com todas as configurações ativas."""
+    settings = dict(DEFAULT_SETTINGS)
+    database_path = get_database_path()
+    if not database_path.exists():
+        return settings
+
+    try:
+        with sqlite3.connect(database_path) as connection:
+            _ensure_schema(connection)
+            rows = connection.execute("SELECT key, value FROM app_settings").fetchall()
+            for k, v in rows:
+                settings[k] = v
+            return settings
+    except sqlite3.Error:
+        return settings
+
+
 def _sync_cache_files(positions=None, rules=None):
-    """Sincroniza um arquivo JSON para consumo instantâneo pela extensão GNOME Shell."""
+    """Sincroniza presets.json para consumo instantâneo pela extensão GNOME Shell."""
     try:
         db_path = get_database_path()
         if positions is None:
@@ -148,7 +354,7 @@ def _sync_cache_files(positions=None, rules=None):
                 with sqlite3.connect(db_path) as conn:
                     conn.row_factory = sqlite3.Row
                     _ensure_schema(conn)
-                    rows = conn.execute("SELECT * FROM saved_positions ORDER BY id DESC").fetchall()
+                    rows = conn.execute("SELECT * FROM saved_positions ORDER BY sort_order ASC, id DESC").fetchall()
                     positions = [dict(r) for r in rows]
 
         if rules is None:
@@ -160,7 +366,8 @@ def _sync_cache_files(positions=None, rules=None):
                     _ensure_schema(conn)
                     rows = conn.execute(
                         """
-                        SELECT r.*, p.name AS position_name, p.width, p.height, p.global_x, p.global_y, p.monitor_index
+                        SELECT r.*, p.name AS position_name, p.width, p.height, p.global_x, p.global_y,
+                               p.monitor_index, p.dont_resize, p.dont_move
                         FROM window_rules r
                         JOIN saved_positions p ON r.position_id = p.id
                         ORDER BY r.id DESC
@@ -175,13 +382,17 @@ def _sync_cache_files(positions=None, rules=None):
             {
                 "id": p.get("id"),
                 "name": p.get("name"),
+                "group": p.get("group_name") or None,
                 "width": p.get("width"),
                 "height": p.get("height"),
                 "global_x": p.get("global_x"),
                 "global_y": p.get("global_y"),
                 "monitor_index": p.get("monitor_index", 0),
-                "preset_type": "universal",
+                "dont_resize": bool(p.get("dont_resize")),
+                "dont_move": bool(p.get("dont_move")),
+                "preset_type": p.get("preset_type") or "universal",
                 "application": p.get("application") or "",
+                "sort_order": p.get("sort_order", 0),
             }
             for p in positions
         ]
@@ -200,12 +411,19 @@ def _sync_cache_files(positions=None, rules=None):
                 "global_x": r.get("global_x"),
                 "global_y": r.get("global_y"),
                 "monitor_index": r.get("monitor_index", 0),
+                "dont_resize": bool(r.get("dont_resize")),
+                "dont_move": bool(r.get("dont_move")),
             }
             for r in rules
         ]
 
+        # Extrai grupos únicos
+        groups = sorted(list({p["group"] for p in presets_data if p["group"]}))
+
         payload = {
-            "version": 2,
+            "version": 3,
+            "settings": get_all_settings(),
+            "groups": groups,
             "presets": presets_data,
             "rules": rules_data,
         }
@@ -267,7 +485,6 @@ def create_window_rule(name, position_id, match_title=None, match_app=None, is_a
         database_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(database_path) as connection:
             _ensure_schema(connection)
-            # Verifica se a posição existe
             pos = connection.execute("SELECT id FROM saved_positions WHERE id = ?", (val_pos_id,)).fetchone()
             if not pos:
                 raise StorageError(f"Posição com ID {val_pos_id} não existe.")
@@ -312,19 +529,24 @@ def list_window_rules():
                     p.height,
                     p.global_x,
                     p.global_y,
-                    p.monitor_index
+                    p.monitor_index,
+                    p.dont_resize,
+                    p.dont_move,
+                    p.group_name
                 FROM window_rules r
                 JOIN saved_positions p ON r.position_id = p.id
                 ORDER BY r.id DESC
                 """
             ).fetchall()
-            return [dict(row) for row in rows]
+            results = [dict(row) for row in rows]
+            _sync_cache_files(rules=results)
+            return results
     except sqlite3.Error as error:
         raise StorageError(f"Erro SQLite ao listar regras de janela: {error}") from error
 
 
 def update_window_rule(rule_id, name, position_id, match_title=None, match_app=None, is_active=True):
-    """Atualiza uma regra existente."""
+    """Atualiza as informações de uma regra de janela existente."""
     val_rule_id = _validate_position_id(rule_id)
     clean_name = _clean_text(name)
     if not clean_name:
@@ -346,6 +568,10 @@ def update_window_rule(rule_id, name, position_id, match_title=None, match_app=N
 
         with sqlite3.connect(database_path) as connection:
             _ensure_schema(connection)
+            pos = connection.execute("SELECT id FROM saved_positions WHERE id = ?", (val_pos_id,)).fetchone()
+            if not pos:
+                raise StorageError(f"Posição com ID {val_pos_id} não existe.")
+
             cursor = connection.execute(
                 """
                 UPDATE window_rules
@@ -525,41 +751,48 @@ def update_saved_position_geometry(position_id, window, application):
 
 def create_manual_preset(
     name,
-    width,
-    height,
+    width=None,
+    height=None,
     global_x=None,
     global_y=None,
     monitor_index=0,
     preset_type="universal",
     application_name=None,
+    group_name=None,
+    dont_resize=False,
+    dont_move=False,
 ):
-    """Cria um preset com dimensões manuais em pixels."""
+    """Cria um preset com dimensões ou posicionamento em pixels."""
     clean_name = _clean_text(name)
     if not clean_name:
         raise StorageError("O nome do preset não pode ser vazio.")
 
-    width_val = _int_or_none(width)
-    height_val = _int_or_none(height)
-    if not width_val or width_val <= 0 or not height_val or height_val <= 0:
-        raise StorageError("Largura e altura devem ser números inteiros maiores que zero.")
+    width_val = None
+    height_val = None
+    if not dont_resize:
+        width_val = _int_or_none(width)
+        height_val = _int_or_none(height)
+        if not width_val or width_val <= 0 or not height_val or height_val <= 0:
+            raise StorageError("Largura e altura devem ser números inteiros maiores que zero.")
 
     created_at = datetime.now(timezone.utc).isoformat()
     clean_type = "universal"
     clean_app = _clean_text(application_name)
+    clean_group = _text_or_none(group_name)
 
     snapshot = {
         "window": {
             "title": clean_name,
             "monitorIndex": monitor_index or 0,
             "frame": {
-                "x": global_x if global_x is not None else 0,
-                "y": global_y if global_y is not None else 0,
+                "x": None if dont_move else (global_x if global_x is not None else 0),
+                "y": None if dont_move else (global_y if global_y is not None else 0),
                 "width": width_val,
                 "height": height_val,
             },
             "relative": {
-                "x": global_x if global_x is not None else 0,
-                "y": global_y if global_y is not None else 0,
+                "x": None if dont_move else (global_x if global_x is not None else 0),
+                "y": None if dont_move else (global_y if global_y is not None else 0),
             },
         },
         "application": {
@@ -588,8 +821,12 @@ def create_manual_preset(
                     width,
                     height,
                     snapshot_json,
-                    preset_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    preset_type,
+                    group_name,
+                    dont_resize,
+                    dont_move,
+                    sort_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_name,
@@ -597,14 +834,18 @@ def create_manual_preset(
                     clean_app or None,
                     clean_name,
                     monitor_index or 0,
-                    _int_or_none(global_x),
-                    _int_or_none(global_y),
-                    _int_or_none(global_x),
-                    _int_or_none(global_y),
+                    None if dont_move else _int_or_none(global_x),
+                    None if dont_move else _int_or_none(global_y),
+                    None if dont_move else _int_or_none(global_x),
+                    None if dont_move else _int_or_none(global_y),
                     width_val,
                     height_val,
                     snapshot_json,
                     clean_type,
+                    clean_group,
+                    1 if dont_resize else 0,
+                    1 if dont_move else 0,
+                    0,
                 ),
             )
             connection.commit()
@@ -618,13 +859,16 @@ def create_manual_preset(
 def update_manual_preset(
     position_id,
     name,
-    width,
-    height,
+    width=None,
+    height=None,
     global_x=None,
     global_y=None,
     monitor_index=0,
     preset_type="universal",
     application_name=None,
+    group_name=None,
+    dont_resize=False,
+    dont_move=False,
 ):
     """Atualiza as informações manuais de um preset."""
     validated_id = _validate_position_id(position_id)
@@ -632,27 +876,31 @@ def update_manual_preset(
     if not clean_name:
         raise StorageError("O nome do preset não pode ser vazio.")
 
-    width_val = _int_or_none(width)
-    height_val = _int_or_none(height)
-    if not width_val or width_val <= 0 or not height_val or height_val <= 0:
-        raise StorageError("Largura e altura devem ser números inteiros maiores que zero.")
+    width_val = None
+    height_val = None
+    if not dont_resize:
+        width_val = _int_or_none(width)
+        height_val = _int_or_none(height)
+        if not width_val or width_val <= 0 or not height_val or height_val <= 0:
+            raise StorageError("Largura e altura devem ser números inteiros maiores que zero.")
 
     clean_type = "universal"
     clean_app = _clean_text(application_name)
+    clean_group = _text_or_none(group_name)
 
     snapshot = {
         "window": {
             "title": clean_name,
             "monitorIndex": monitor_index or 0,
             "frame": {
-                "x": global_x if global_x is not None else 0,
-                "y": global_y if global_y is not None else 0,
+                "x": None if dont_move else (global_x if global_x is not None else 0),
+                "y": None if dont_move else (global_y if global_y is not None else 0),
                 "width": width_val,
                 "height": height_val,
             },
             "relative": {
-                "x": global_x if global_x is not None else 0,
-                "y": global_y if global_y is not None else 0,
+                "x": None if dont_move else (global_x if global_x is not None else 0),
+                "y": None if dont_move else (global_y if global_y is not None else 0),
             },
         },
         "application": {
@@ -683,7 +931,10 @@ def update_manual_preset(
                     width = ?,
                     height = ?,
                     snapshot_json = ?,
-                    preset_type = ?
+                    preset_type = ?,
+                    group_name = ?,
+                    dont_resize = ?,
+                    dont_move = ?
                 WHERE id = ?
                 """,
                 (
@@ -691,14 +942,17 @@ def update_manual_preset(
                     clean_app or None,
                     clean_name,
                     monitor_index or 0,
-                    _int_or_none(global_x),
-                    _int_or_none(global_y),
-                    _int_or_none(global_x),
-                    _int_or_none(global_y),
+                    None if dont_move else _int_or_none(global_x),
+                    None if dont_move else _int_or_none(global_y),
+                    None if dont_move else _int_or_none(global_x),
+                    None if dont_move else _int_or_none(global_y),
                     width_val,
                     height_val,
                     snapshot_json,
                     clean_type,
+                    clean_group,
+                    1 if dont_resize else 0,
+                    1 if dont_move else 0,
                     validated_id,
                 ),
             )
@@ -711,6 +965,62 @@ def update_manual_preset(
         raise StorageError(f"Erro SQLite ao atualizar preset manual: {error}") from error
 
 
+def export_configuration_json():
+    """Exporta todas as posições, regras e configurações para uma string JSON formatada."""
+    positions = list_saved_positions()
+    rules = list_window_rules()
+    settings = get_all_settings()
+
+    data = {
+        "version": 3,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "settings": settings,
+        "positions": positions,
+        "rules": rules,
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def import_configuration_json(json_content):
+    """Importa posições, regras e configurações a partir de uma string JSON."""
+    if not json_content:
+        raise StorageError("O conteúdo JSON está vazio.")
+
+    try:
+        data = json.loads(json_content)
+    except Exception as err:
+        raise StorageError(f"JSON inválido: {err}") from err
+
+    if not isinstance(data, dict):
+        raise StorageError("O formato do arquivo JSON de backup é inválido.")
+
+    # Importa configurações
+    settings = data.get("settings", {})
+    if isinstance(settings, dict):
+        for k, v in settings.items():
+            set_setting(k, v)
+
+    positions = data.get("positions", [])
+    if isinstance(positions, list):
+        for p in positions:
+            name = p.get("name")
+            if not name:
+                continue
+            create_manual_preset(
+                name=name,
+                width=p.get("width"),
+                height=p.get("height"),
+                global_x=p.get("global_x"),
+                global_y=p.get("global_y"),
+                monitor_index=p.get("monitor_index", 0),
+                group_name=p.get("group_name"),
+                dont_resize=bool(p.get("dont_resize")),
+                dont_move=bool(p.get("dont_move")),
+            )
+    _sync_cache_files()
+    return True
+
+
 def seed_default_presets_if_empty():
     """Gera presets clássicos iniciais caso a base esteja vazia."""
     database_path = get_database_path()
@@ -721,14 +1031,20 @@ def seed_default_presets_if_empty():
             count = connection.execute("SELECT count(*) FROM saved_positions").fetchone()[0]
             if count == 0:
                 defaults = [
-                    ("640 × 480 (VGA 4:3)", 640, 480),
-                    ("800 × 600 (SVGA 4:3)", 800, 600),
-                    ("1024 × 768 (XGA 4:3)", 1024, 768),
-                    ("1280 × 720 (HD 16:9)", 1280, 720),
-                    ("1920 × 1080 (Full HD 16:9)", 1920, 1080),
+                    # Itens avulsos populares
+                    ("HD 720p (16:9)", 1280, 720, None),
+                    ("Full HD 1080p (16:9)", 1920, 1080, None),
+                    # Grupo 4:3
+                    ("640 × 480 (VGA)", 640, 480, "4:3"),
+                    ("800 × 600 (SVGA)", 800, 600, "4:3"),
+                    ("1024 × 768 (XGA)", 1024, 768, "4:3"),
+                    # Grupo YouTube
+                    ("YouTube 480p", 854, 480, "YouTube"),
+                    ("YouTube 720p", 1280, 720, "YouTube"),
+                    ("YouTube 1080p", 1920, 1080, "YouTube"),
                 ]
-                for name, width, height in defaults:
-                    create_manual_preset(name, width, height, preset_type="global")
+                for name, width, height, grp in defaults:
+                    create_manual_preset(name, width, height, group_name=grp)
     except Exception:
         pass
 
@@ -766,13 +1082,25 @@ def _ensure_schema(connection):
             width INTEGER,
             height INTEGER,
             snapshot_json TEXT NOT NULL,
-            preset_type TEXT DEFAULT 'app_specific'
+            preset_type TEXT DEFAULT 'universal',
+            group_name TEXT DEFAULT NULL,
+            dont_resize INTEGER DEFAULT 0,
+            dont_move INTEGER DEFAULT 0,
+            sort_order INTEGER DEFAULT 0
         )
         """
     )
     columns = [row[1] for row in connection.execute("PRAGMA table_info(saved_positions)").fetchall()]
     if "preset_type" not in columns:
         connection.execute("ALTER TABLE saved_positions ADD COLUMN preset_type TEXT DEFAULT 'universal'")
+    if "group_name" not in columns:
+        connection.execute("ALTER TABLE saved_positions ADD COLUMN group_name TEXT DEFAULT NULL")
+    if "dont_resize" not in columns:
+        connection.execute("ALTER TABLE saved_positions ADD COLUMN dont_resize INTEGER DEFAULT 0")
+    if "dont_move" not in columns:
+        connection.execute("ALTER TABLE saved_positions ADD COLUMN dont_move INTEGER DEFAULT 0")
+    if "sort_order" not in columns:
+        connection.execute("ALTER TABLE saved_positions ADD COLUMN sort_order INTEGER DEFAULT 0")
 
     connection.execute(
         """
@@ -785,6 +1113,15 @@ def _ensure_schema(connection):
             is_active INTEGER DEFAULT 1,
             created_at TEXT NOT NULL,
             FOREIGN KEY (position_id) REFERENCES saved_positions(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )
         """
     )
