@@ -17,5 +17,6 @@ logs/
 # Python virtual environments
 .venv/
 venv/
-env/
-ENV/
+# External installers and binaries
+*.msi
+docs/sizer_extracted/
