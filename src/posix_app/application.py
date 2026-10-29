@@ -63,10 +63,26 @@ class PosiXApplication(Adw.Application):
         self._window = None
 
     def do_activate(self):
+        self._ensure_extension_enabled()
         if self._window is None:
             self._window = MainWindow(self)
 
         self._window.present()
+
+    def _ensure_extension_enabled(self):
+        try:
+            import subprocess
+
+            res = subprocess.run(
+                ["gnome-extensions", "info", "posix@linker"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if "Estado: INACTIVE" in res.stdout or "Habilitado: Não" in res.stdout:
+                subprocess.run(["gnome-extensions", "enable", "posix@linker"], timeout=2)
+        except Exception:
+            pass
 
 
 class MainWindow(Adw.ApplicationWindow):

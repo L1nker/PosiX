@@ -470,6 +470,81 @@ export default class PosiXExtension extends Extension {
             this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
             this._populateMenuWithPresets(this._indicator.menu, data, null, null);
         }
+
+        // 4. Separador e Opções de Fechar / Encerrar
+        this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        if (this._isPosiXWindowOpen()) {
+            const closeWindowItem = new PopupMenu.PopupMenuItem('🚪 Fechar Janela do Painel');
+            closeWindowItem.connect('activate', () => {
+                this._closePosiXWindow();
+            });
+            this._indicator.menu.addMenuItem(closeWindowItem);
+        }
+
+        const quitItem = new PopupMenu.PopupMenuItem('🛑 Encerrar PosiX');
+        quitItem.connect('activate', () => {
+            this._quitPosiX();
+        });
+        this._indicator.menu.addMenuItem(quitItem);
+    }
+
+    _isPosiXWindowOpen() {
+        try {
+            const actors = this._safeCall(() => global.get_window_actors(), []);
+            for (const actor of actors) {
+                const win = this._safeCall(() => actor.get_meta_window(), null);
+                if (!win) continue;
+                const title = String(this._safeCall(() => win.get_title(), '') || '');
+                const wmClass = String(this._safeCall(() => win.get_wm_class(), '') || '');
+                if (title.includes('PosiX Configuration') || title.includes('Painel PosiX') || wmClass === 'io.github.L1nker.PosiX.App') {
+                    return true;
+                }
+            }
+        } catch (_e) {}
+        return false;
+    }
+
+    _closePosiXWindow() {
+        try {
+            const proc = new Gio.Subprocess({
+                argv: ['bash', '-c', 'pkill -f "python3 -m posix_app" || true'],
+                flags: Gio.SubprocessFlags.NONE,
+            });
+            proc.init(null);
+            Main.notify('PosiX', 'Janela do painel fechada.');
+        } catch (e) {
+            this._log(`Erro ao fechar janela do PosiX: ${e.message}`);
+        }
+    }
+
+    _quitPosiX() {
+        try {
+            const proc = new Gio.Subprocess({
+                argv: ['bash', '-c', 'pkill -f "python3 -m posix_app" || true'],
+                flags: Gio.SubprocessFlags.NONE,
+            });
+            proc.init(null);
+        } catch (e) {
+            this._log(`Erro ao encerrar processos do PosiX: ${e.message}`);
+        }
+
+        try {
+            Main.notify('PosiX', 'PosiX encerrado. Para reabrir, inicie pelo menu de aplicativos.');
+        } catch (_e) {}
+
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            try {
+                const disableProc = new Gio.Subprocess({
+                    argv: ['gnome-extensions', 'disable', 'posix@linker'],
+                    flags: Gio.SubprocessFlags.NONE,
+                });
+                disableProc.init(null);
+            } catch (err) {
+                this._log(`Erro ao desativar extensão: ${err.message}`);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _launchApp() {

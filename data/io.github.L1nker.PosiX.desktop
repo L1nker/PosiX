@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=PosiX
+GenericName=Gerenciador de Janelas
+Comment=Redimensionador e restaurador de posições de janelas (estilo Sizer)
+Exec=bash -c "gnome-extensions enable posix@linker 2>/dev/null; PYTHONPATH=/home/linker/AG_Local/PosiX/src python3 -m posix_app"
+Icon=focus-windows-symbolic
+Terminal=false
+Type=Application
+Categories=Utility;GTK;
+StartupNotify=true
+StartupWMClass=io.github.L1nker.PosiX.App
+Keywords=window;size;resize;sizer;posix;janela;posicao;redimensionar;
