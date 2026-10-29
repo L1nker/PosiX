@@ -169,9 +169,23 @@ class MainWindow(Adw.ApplicationWindow):
         self._apply_btn.connect("clicked", self._on_apply_selected_clicked)
         bottom_box.append(self._apply_btn)
 
-        close_btn = Gtk.Button(label="Fechar")
+        close_btn = Gtk.Button(label="Fechar Janela")
         close_btn.connect("clicked", lambda _: self.close())
         bottom_box.append(close_btn)
+
+        quit_btn = Gtk.Button(label="🛑 Encerrar PosiX")
+        quit_btn.add_css_class("destructive-action")
+        quit_btn.set_tooltip_text("Fecha o PosiX e encerra completamente a extensão da bandeja")
+        quit_btn.connect("clicked", self._on_quit_posix_clicked)
+        bottom_box.append(quit_btn)
+
+    def _on_quit_posix_clicked(self, _):
+        try:
+            import subprocess
+            subprocess.run(["gnome-extensions", "disable", "posix@linker"], timeout=2)
+        except Exception:
+            pass
+        self.get_application().quit()
 
     def _build_menu_page(self):
         """Constrói a aba Menu com layout em 2 colunas igual ao Sizer 4.0."""
